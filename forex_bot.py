@@ -20,8 +20,13 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
 (VPS/сервер), не на ноутбуке, который выключается.
 
 Нужные вводные:
-1. BOT_TOKEN         — токен от @BotFather.
-2. ANTHROPIC_API_KEY — ключ с platform.claude.com (нужна привязанная карта).
+1. BOT_TOKEN         — токен от @BotFather (обязателен).
+2. ANTHROPIC_API_KEY — ключ с platform.claude.com (опционален). Без него бот
+   всё равно работает: календарь по /start и сырые цифры по расписанию
+   отправляются как обычно, просто вместо AI-анализа (прогноз-предположение,
+   сводка перед NYSE, /forecast) будет пометка, что AI недоступен, и сырые
+   данные без интерпретации. Как только ключ появится — просто добавь
+   переменную окружения и перезапусти бота, код менять не нужно.
 
 Зависимости (requirements.txt):
     aiogram, aiohttp, feedparser, anthropic
@@ -49,7 +54,8 @@ from aiogram.types import Message
 from anthropic import AsyncAnthropic
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "PUT_YOUR_KEY_HERE")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -79,7 +85,7 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if CLAUDE_ENABLED else None
 
 
 # ---------- Хранилище ----------
@@ -231,13 +237,24 @@ USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD, Золото (XAU), Нефть (WTI/Bren
 Без вступления, без заключения, без дисклеймеров — только список из 10 строк."""
 
 
-async def ask_claude(prompt: str) -> str:
-    resp = await claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
+NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
+
+
+async def ask_claude(prompt: str, fallback: str) -> str:
+    """Возвращает ответ Claude, если ключ настроен, иначе — заглушку fallback
+    с пометкой, что AI-анализ временно недоступен."""
+    if not CLAUDE_ENABLED:
+        return NO_KEY_NOTICE + fallback
+    try:
+        resp = await claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        logger.exception("Ошибка запроса к Claude, отдаю сырые данные")
+        return NO_KEY_NOTICE + fallback
 
 
 async def send_to_subscribers(text: str) -> None:
@@ -277,11 +294,8 @@ async def on_forecast(message: Message) -> None:
         calendar_summary=format_calendar_summary(events),
         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
     )
-    try:
-        forecast = await ask_claude(prompt)
-    except Exception as e:
-        await message.answer(f"Не удалось построить прогноз: {e}")
-        return
+    fallback = format_calendar_summary(events)
+    forecast = await ask_claude(prompt, fallback)
     await message.answer(f"🔮 <b>Быстрый прогноз по валютам</b>\n\n{forecast}", parse_mode="HTML")
 
 
@@ -302,13 +316,17 @@ async def scheduler_loop() -> None:
                     trigger_at = ev["_dt"].astimezone(timezone.utc) - PRE_EVENT_LEAD
                     if now_utc >= trigger_at:
                         headlines = fetch_recent_headlines()
+                        raw_fallback = (
+                            f"Прогноз рынка: {ev.get('forecast') or 'нет данных'}\n"
+                            f"Предыдущее значение: {ev.get('previous') or 'нет данных'}"
+                        )
                         prediction = await ask_claude(PREDICT_PROMPT.format(
                             currency=ev.get("country"),
                             title=ev.get("title"),
                             forecast=ev.get("forecast") or "нет данных",
                             previous=ev.get("previous") or "нет данных",
                             headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
-                        ))
+                        ), raw_fallback)
                         time_str = ev["_dt"].astimezone().strftime("%H:%M")
                         text = (
                             f"🔮 <b>Через час: {ev.get('country')} — {ev.get('title')} ({time_str})</b>\n\n"
@@ -322,9 +340,12 @@ async def scheduler_loop() -> None:
                 trigger_at_ny = datetime.combine(ny_now.date(), NYSE_OPEN, tzinfo=NY_TZ) - PRE_NYSE_LEAD
                 if ny_now >= trigger_at_ny and not state["quiet_summary_sent"]:
                     headlines = fetch_recent_headlines()
+                    fallback = "Важных релизов сегодня нет. Свежие заголовки:\n" + (
+                        "\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков"
+                    )
                     summary = await ask_claude(QUIET_PROMPT.format(
                         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
-                    ))
+                    ), fallback)
                     text = "🗞 <b>Сводка перед открытием NYSE</b>\n\n" + summary
                     await send_to_subscribers(text)
                     state["quiet_summary_sent"] = True
@@ -338,8 +359,10 @@ async def scheduler_loop() -> None:
 
 
 async def main() -> None:
-    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE" or ANTHROPIC_API_KEY == "PUT_YOUR_KEY_HERE":
-        raise RuntimeError("Установите переменные окружения BOT_TOKEN и ANTHROPIC_API_KEY")
+    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
+        raise RuntimeError("Установите переменную окружения BOT_TOKEN")
+    if not CLAUDE_ENABLED:
+        logger.warning("ANTHROPIC_API_KEY не задан — бот работает без AI-анализа, только сырые данные")
     asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
 
