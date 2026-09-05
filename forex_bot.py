@@ -1,0 +1,348 @@
+"""
+Telegram-бот: форекс-сводка + прогнозы перед важными релизами.
+
+Логика (проверяется раз в 5 минут, но реально что-то делает только по расписанию):
+1. Каждый день бот смотрит календарь (ForexFactory) на сегодня.
+2. Если сегодня ЕСТЬ важные (High impact) релизы по основным валютам:
+   - за 1 час до КАЖДОГО такого релиза бот присылает прогноз-предположение:
+     как обычно эта статистика влияет на валюту, чего ждёт рынок (по
+     прогнозу/предыдущему значению) и что будет, если факт выйдет выше/ниже
+     ожиданий — с учётом свежих новостных заголовков за последние часы.
+3. Если сегодня важных релизов НЕТ:
+   - один раз, перед открытием NYSE (9:30 по Нью-Йорку), присылает общую
+     сводку факторов, которые могут повлиять на рынок сегодня, на основе
+     последних новостных заголовков.
+4. /start подписывает на уведомления и сразу присылает сводку календаря на
+   сегодня. Команда /forecast — по запросу короткий прогноз-настроение
+   (бычье/медвежье/нейтральное) по каждой из основных валют, золоту и нефти.
+
+ВАЖНО: это фоновый процесс, должен работать круглосуточно на чём-то always-on
+(VPS/сервер), не на ноутбуке, который выключается.
+
+Нужные вводные:
+1. BOT_TOKEN         — токен от @BotFather.
+2. ANTHROPIC_API_KEY — ключ с platform.claude.com (нужна привязанная карта).
+
+Зависимости (requirements.txt):
+    aiogram, aiohttp, feedparser, anthropic
+
+Запуск:
+    pip install -r requirements.txt
+    export BOT_TOKEN="..."
+    export ANTHROPIC_API_KEY="..."
+    python forex_bot.py
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import aiohttp
+import feedparser
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+from anthropic import AsyncAnthropic
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "PUT_YOUR_KEY_HERE")
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+RSS_FEEDS = [
+    "https://www.forexlive.com/feed/news",
+    "https://www.fxstreet.com/rss/news",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://oilprice.com/rss/main",
+    "https://www.kitco.com/rss/KitcoNews.xml",
+]
+
+MAJOR_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
+IMPACT_EMOJI = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Holiday": "⚪️"}
+
+NY_TZ = ZoneInfo("America/New_York")
+NYSE_OPEN = time(9, 30)
+PRE_EVENT_LEAD = timedelta(hours=1)   # прогноз за час до важного релиза
+PRE_NYSE_LEAD = timedelta(minutes=30)  # сводка за 30 мин до открытия NYSE
+POLL_INTERVAL = 5 * 60  # как часто "просыпаться" и сверяться с расписанием
+
+DATA_DIR = Path(__file__).parent
+SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
+STATE_FILE = DATA_DIR / "daily_state.json"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# ---------- Хранилище ----------
+
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text())
+    return default
+
+
+def save_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def get_subscribers() -> set[int]:
+    return set(load_json(SUBSCRIBERS_FILE, []))
+
+
+def add_subscriber(chat_id: int) -> None:
+    subs = get_subscribers()
+    if chat_id not in subs:
+        subs.add(chat_id)
+        save_json(SUBSCRIBERS_FILE, list(subs))
+
+
+def load_state() -> dict:
+    state = load_json(STATE_FILE, {})
+    today_str = date.today().isoformat()
+    if state.get("date") != today_str:
+        state = {"date": today_str, "notified_events": [], "quiet_summary_sent": False}
+        save_json(STATE_FILE, state)
+    return state
+
+
+def save_state(state: dict) -> None:
+    save_json(STATE_FILE, state)
+
+
+# ---------- Экономический календарь ----------
+
+def parse_event_time(raw: str):
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def fetch_calendar() -> list[dict]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(CALENDAR_URL, timeout=15) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+def filter_today(events: list[dict], impacts: tuple[str, ...]) -> list[dict]:
+    today = datetime.now(timezone.utc).date()
+    result = []
+    for ev in events:
+        dt = parse_event_time(ev.get("date", ""))
+        if dt is None or dt.astimezone(timezone.utc).date() != today:
+            continue
+        if ev.get("country") not in MAJOR_CURRENCIES:
+            continue
+        if ev.get("impact") not in impacts:
+            continue
+        ev = {**ev, "_dt": dt, "_id": f"{ev.get('country')}_{ev.get('title')}_{ev.get('date')}"}
+        result.append(ev)
+    result.sort(key=lambda e: e["_dt"])
+    return result
+
+
+def format_calendar_summary(events: list[dict]) -> str:
+    if not events:
+        return "📅 Сегодня нет значимых экономических событий по основным валютам."
+    lines = ["📊 <b>Экономическая сводка на сегодня</b>\n"]
+    for ev in events:
+        emoji = IMPACT_EMOJI.get(ev.get("impact"), "⚪️")
+        time_str = ev["_dt"].astimezone().strftime("%H:%M")
+        lines.append(
+            f"{emoji} <b>{time_str} {ev.get('country')}</b> — {ev.get('title')}\n"
+            f"    Прогноз: {ev.get('forecast') or '—'} | Пред.: {ev.get('previous') or '—'}"
+        )
+    lines.append("\n<i>Источник: ForexFactory calendar</i>")
+    return "\n".join(lines)
+
+
+# ---------- Новости (контекст для прогнозов) ----------
+
+def fetch_recent_headlines(limit: int = 12) -> list[str]:
+    headlines = []
+    for url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            headlines.extend(e.get("title", "") for e in feed.entries[:8])
+        except Exception:
+            logger.exception(f"Не удалось прочитать RSS: {url}")
+    return headlines[:limit]
+
+
+# ---------- Генерация прогнозов через Claude ----------
+
+PREDICT_PROMPT = """Ты аналитик форекс-рынка. Через час выходит статистика:
+
+Страна/валюта: {currency}
+Показатель: {title}
+Прогноз рынка: {forecast}
+Предыдущее значение: {previous}
+
+Свежие новостные заголовки последних часов (могут быть не по теме — учитывай
+только релевантные):
+{headlines}
+
+Напиши короткий прогноз по-русски (4-5 предложений):
+- как этот показатель обычно влияет на валюту;
+- если факт выйдет ЛУЧШЕ прогноза — что вероятно произойдёт с валютой;
+- если факт выйдет ХУЖЕ прогноза — что вероятно произойдёт с валютой;
+- отдельно — как это может отразиться на золоте (XAU/USD) и нефти (WTI/Brent),
+  если показатель по USD (доллар и золото/нефть обычно двигаются в противофазе,
+  доллар и нефть — по-разному в зависимости от причины движения);
+- если в заголовках есть релевантный контекст (в т.ч. по золоту/нефти/OPEC), учти его.
+Без общих фраз и дисклеймеров, только суть."""
+
+QUIET_PROMPT = """Ты аналитик форекс и товарных рынков. Сегодня нет запланированных
+важных экономических релизов по основным валютам. Перед открытием NYSE дай
+короткую сводку по-русски (4-6 предложений) на основе свежих новостных
+заголовков: что может повлиять сегодня на доллар и другие основные валюты, а
+также отдельно — на золото (XAU/USD) и нефть (WTI/Brent), если такие факторы
+вообще просматриваются в заголовках (геополитика, решения OPEC+, запасы нефти,
+спрос на защитные активы и т.п.). Если ничего значимого нет — так и скажи
+одной фразой, не выдумывай.
+
+Заголовки:
+{headlines}"""
+
+FORECAST_PROMPT = """Ты аналитик форекс и товарных рынков. Вот экономические
+события на сегодня (High/Medium impact) по основным валютам:
+{calendar_summary}
+
+Свежие новостные заголовки:
+{headlines}
+
+Дай короткое настроение (бычье/медвежье/нейтральное) по каждой из позиций:
+USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD, Золото (XAU), Нефть (WTI/Brent).
+
+Формат — строго по одной строке на каждую позицию, на русском:
+<эмодзи 📈 или 📉 или ➡️> <Валюта/актив>: <причина в 5-10 слов>
+
+Если по позиции нет значимых факторов сегодня — напиши "нет выраженного драйвера".
+Без вступления, без заключения, без дисклеймеров — только список из 10 строк."""
+
+
+async def ask_claude(prompt: str) -> str:
+    resp = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.content[0].text.strip()
+
+
+async def send_to_subscribers(text: str) -> None:
+    for chat_id in get_subscribers():
+        try:
+            await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            logger.exception(f"Не удалось отправить сообщение в {chat_id}")
+
+
+# ---------- Хендлеры бота ----------
+
+@dp.message(CommandStart())
+async def on_start(message: Message) -> None:
+    add_subscriber(message.chat.id)
+    await message.answer("Подписал на уведомления. Собираю сводку на сегодня...")
+    try:
+        raw_events = await fetch_calendar()
+    except Exception as e:
+        await message.answer(f"Не удалось получить календарь: {e}")
+        return
+    events = filter_today(raw_events, ("High", "Medium"))
+    await message.answer(format_calendar_summary(events), parse_mode="HTML")
+
+
+@dp.message(Command("forecast"))
+async def on_forecast(message: Message) -> None:
+    await message.answer("Строю прогноз по валютам, золоту и нефти...")
+    try:
+        raw_events = await fetch_calendar()
+    except Exception as e:
+        await message.answer(f"Не удалось получить календарь: {e}")
+        return
+    events = filter_today(raw_events, ("High", "Medium"))
+    headlines = fetch_recent_headlines()
+    prompt = FORECAST_PROMPT.format(
+        calendar_summary=format_calendar_summary(events),
+        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+    )
+    try:
+        forecast = await ask_claude(prompt)
+    except Exception as e:
+        await message.answer(f"Не удалось построить прогноз: {e}")
+        return
+    await message.answer(f"🔮 <b>Быстрый прогноз по валютам</b>\n\n{forecast}", parse_mode="HTML")
+
+
+# ---------- Планировщик ----------
+
+async def scheduler_loop() -> None:
+    while True:
+        try:
+            state = load_state()
+            raw_events = await fetch_calendar()
+            high_events = filter_today(raw_events, ("High",))
+            now_utc = datetime.now(timezone.utc)
+
+            if high_events:
+                for ev in high_events:
+                    if ev["_id"] in state["notified_events"]:
+                        continue
+                    trigger_at = ev["_dt"].astimezone(timezone.utc) - PRE_EVENT_LEAD
+                    if now_utc >= trigger_at:
+                        headlines = fetch_recent_headlines()
+                        prediction = await ask_claude(PREDICT_PROMPT.format(
+                            currency=ev.get("country"),
+                            title=ev.get("title"),
+                            forecast=ev.get("forecast") or "нет данных",
+                            previous=ev.get("previous") or "нет данных",
+                            headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+                        ))
+                        time_str = ev["_dt"].astimezone().strftime("%H:%M")
+                        text = (
+                            f"🔮 <b>Через час: {ev.get('country')} — {ev.get('title')} ({time_str})</b>\n\n"
+                            f"{prediction}"
+                        )
+                        await send_to_subscribers(text)
+                        state["notified_events"].append(ev["_id"])
+                        save_state(state)
+            else:
+                ny_now = datetime.now(NY_TZ)
+                trigger_at_ny = datetime.combine(ny_now.date(), NYSE_OPEN, tzinfo=NY_TZ) - PRE_NYSE_LEAD
+                if ny_now >= trigger_at_ny and not state["quiet_summary_sent"]:
+                    headlines = fetch_recent_headlines()
+                    summary = await ask_claude(QUIET_PROMPT.format(
+                        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+                    ))
+                    text = "🗞 <b>Сводка перед открытием NYSE</b>\n\n" + summary
+                    await send_to_subscribers(text)
+                    state["quiet_summary_sent"] = True
+                    save_state(state)
+
+            logger.info("Цикл планировщика завершён")
+        except Exception:
+            logger.exception("Ошибка в планировщике")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def main() -> None:
+    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE" or ANTHROPIC_API_KEY == "PUT_YOUR_KEY_HERE":
+        raise RuntimeError("Установите переменные окружения BOT_TOKEN и ANTHROPIC_API_KEY")
+    asyncio.create_task(scheduler_loop())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
