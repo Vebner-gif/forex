@@ -19,7 +19,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    биткоина с зонами поддержки/сопротивления. Команда /pairs — кнопки с
    популярными парами (EUR/USD, GBP/USD и т.д.), по нажатию — короткий
    анализ по этой паре с реальными ценовыми уровнями (ЕЦБ-курсы для фиатных
-   пар, Binance для BTC) и позиционированием крупных трейдеров (COT-отчёты
+   пар, Coinbase для BTC) и позиционированием крупных трейдеров (COT-отчёты
    CFTC). Команда /indices — кнопки DAX 40 / Nasdaq / S&P 500. Команда
    /news — дайджест из двух блоков: «Главное» (что реально произошло, по
    фактам) и «Что это может значить» (короткий вывод). Команда /ask <вопрос>
@@ -38,7 +38,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
   Oilprice, Kitco, MarketWatch, CNBC + официальные пресс-релизы ФРС, ЕЦБ,
   Банка Англии.
 - Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
-- Цена BTC: Binance (без ключа).
+- Цена BTC: Coinbase (без ключа).
 - Индексы (DAX 40, Nasdaq, S&P 500): Yahoo Finance chart API (без ключа).
 - Позиционирование трейдеров: CFTC Commitment of Traders (публичные данные,
   обновляются раз в неделю, по пятницам).
@@ -114,8 +114,8 @@ EQUITY_RSS_FEEDS = [
 ]
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=100"
+COINBASE_STATS_URL = "https://api.exchange.coinbase.com/products/BTC-USD/stats"
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
 
 # Фондовые индексы через Yahoo Finance chart API (бесплатно, без ключа)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
@@ -367,34 +367,35 @@ def format_technicals(tech: dict, decimals: int = 2) -> str:
 # ---------- Данные по биткоину (реальные цены, не выдумка) ----------
 
 async def fetch_btc_market_data() -> dict:
-    """Binance вместо CoinGecko: не требует ключа и заметно реже блокирует
-    облачные IP (Railway/Render и т.п.). limit=100 дневных свечей — с запасом
-    для MA50."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(BINANCE_TICKER_URL, timeout=15) as resp:
+    """Coinbase вместо Binance: Binance отдаёт 451 (гео-блок) для многих
+    облачных провайдеров (Railway/Render и т.п.), Coinbase — обычно нет."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(COINBASE_STATS_URL, timeout=15) as resp:
             resp.raise_for_status()
-            ticker = await resp.json()
-        async with session.get(BINANCE_KLINES_URL, timeout=15) as resp:
+            stats = await resp.json()
+        async with session.get(COINBASE_CANDLES_URL, timeout=15) as resp:
             resp.raise_for_status()
-            klines = await resp.json()
+            candles = await resp.json()  # [time, low, high, open, close, volume], новые сначала
 
-    current_price = float(ticker["lastPrice"])
-    change_24h = float(ticker["priceChangePercent"])
+    current_price = float(stats["last"])
+    open_price = float(stats.get("open") or current_price)
+    change_24h = ((current_price - open_price) / open_price * 100) if open_price else 0.0
 
-    highs = [float(k[2]) for k in klines]
-    lows = [float(k[3]) for k in klines]
-    closes = [float(k[4]) for k in klines]
-    klines_7d = klines[-7:] if len(klines) >= 7 else klines
-    highs_7d = [float(k[2]) for k in klines_7d]
-    lows_7d = [float(k[3]) for k in klines_7d]
+    candles_asc = list(reversed(candles))  # делаем от старых к новым
+    highs = [float(c[2]) for c in candles_asc]
+    lows = [float(c[1]) for c in candles_asc]
+    closes = [float(c[4]) for c in candles_asc]
+    highs_7 = highs[-7:] if len(highs) >= 7 else highs
+    lows_7 = lows[-7:] if len(lows) >= 7 else lows
     highs_30 = highs[-30:] if len(highs) >= 30 else highs
     lows_30 = lows[-30:] if len(lows) >= 30 else lows
 
     return {
         "price": current_price,
         "change_24h": change_24h,
-        "low_7d": min(lows_7d) if lows_7d else current_price,
-        "high_7d": max(highs_7d) if highs_7d else current_price,
+        "low_7d": min(lows_7) if lows_7 else current_price,
+        "high_7d": max(highs_7) if highs_7 else current_price,
         "low_30d": min(lows_30) if lows_30 else current_price,
         "high_30d": max(highs_30) if highs_30 else current_price,
         **compute_technicals(closes),
