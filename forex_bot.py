@@ -23,7 +23,15 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    CFTC). Команда /indices —
    кнопки DAX 40 / Nasdaq / S&P 500, /index DAX40 — то же текстом. Команда
    /news — дайджест из двух блоков: «Главное» (что реально произошло, по
-   фактам) и «Что это может значить» (короткий вывод).
+   фактам) и «Что это может значить» (короткий вывод). Команда /ask <вопрос>
+   или просто обычное сообщение без команды — бот ответит на любой вопрос
+   с учётом свежих заголовков как контекста.
+
+Защита от устаревших фактов: у Claude есть дата отсечки обучающих данных, и
+он может "помнить" неактуальную информацию (например, кто занимает пост главы
+центробанка). Поэтому в каждый запрос автоматически добавляется инструкция не
+называть людей по имени, если оно не упомянуто в переданных актуальных
+данных/заголовках — только опираться на то, что реально пришло с новостями.
 
 Источники данных:
 - Экономический календарь: ForexFactory (нюфид, кэш 15 мин).
@@ -578,6 +586,18 @@ NEWS_DIGEST_PROMPT = """Ты финансовый редактор. Вот сы�
 Если заголовки малозначимы или это в основном шум — так и скажи в конце
 коротко."""
 
+ASK_PROMPT = """Ты финансовый ассистент, помогаешь с вопросами о рынках
+(форекс, товары, индексы, крипто) и вообще любыми вопросами пользователя.
+
+Немного свежего рыночного контекста (может быть не по теме вопроса —
+используй только если релевантно):
+{headlines}
+
+Вопрос пользователя: {question}
+
+Ответь по-русски, по делу, без лишних вступлений. Если вопрос не по
+финансовой теме — всё равно ответь как обычный полезный ассистент."""
+
 PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная пара: {pair_label}.
 
 События сегодня по {base}: {base_events}
@@ -605,17 +625,31 @@ PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная
 
 NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
 
+# Критично: у Claude есть обучающие данные с определённой датой отсечки, и он
+# может "помнить" устаревшую информацию о том, кто занимает пост (главы
+# центробанков, президенты и т.п.). Эта инструкция заставляет его опираться
+# только на переданные в промпте актуальные данные, а не на свою "память".
+FACTUAL_GUARD = (
+    "\n\nВАЖНО: не полагайся на собственные знания о том, кто СЕЙЧАС занимает "
+    "должности (главы центробанков, президенты, министры и т.п.) — эта "
+    "информация могла устареть. Называй конкретное имя человека только если "
+    "оно явно упомянуто в переданных выше данных или заголовках. Если имя не "
+    "упомянуто — используй должность без имени (например, «глава ФРС», "
+    "«президент США») вместо угадывания, кто это. Дата сегодня: {today}."
+)
+
 
 async def ask_claude(prompt: str, fallback: str) -> str:
     """Возвращает ответ Claude, если ключ настроен, иначе — заглушку fallback
     с пометкой, что AI-анализ временно недоступен."""
     if not CLAUDE_ENABLED:
         return NO_KEY_NOTICE + fallback
+    guarded_prompt = prompt + FACTUAL_GUARD.format(today=date.today().isoformat())
     try:
         resp = await claude.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=400,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": guarded_prompt}],
         )
         return resp.content[0].text.strip()
     except Exception:
@@ -867,6 +901,36 @@ async def on_news(message: Message) -> None:
     await message.answer(f"🗞 <b>Дайджест новостей</b>\n\n{digest}", parse_mode="HTML")
 
 
+async def answer_question(message: Message, question: str) -> None:
+    if not question.strip():
+        await message.answer("Напиши вопрос после команды, например: /ask что будет с долларом на этой неделе?")
+        return
+    headlines = fetch_recent_headlines(limit=8)
+    prompt = ASK_PROMPT.format(
+        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+        question=question.strip(),
+    )
+    fallback = "AI-ответ недоступен без ANTHROPIC_API_KEY. Свежие заголовки:\n" + (
+        "\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков"
+    )
+    answer = await ask_claude(prompt, fallback)
+    await message.answer(answer, parse_mode="HTML")
+
+
+@dp.message(Command("ask"))
+async def on_ask(message: Message) -> None:
+    parts = message.text.split(maxsplit=1)
+    question = parts[1] if len(parts) > 1 else ""
+    await answer_question(message, question)
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_free_text(message: Message) -> None:
+    """Любое обычное сообщение (не команда) воспринимается как вопрос —
+    не нужно вспоминать команду /ask, можно просто написать."""
+    await answer_question(message, message.text)
+
+
 @dp.callback_query(F.data.startswith("pair:"))
 async def on_pair_callback(callback: CallbackQuery) -> None:
     code = callback.data.split(":", 1)[1]
@@ -947,6 +1011,7 @@ BOT_COMMANDS = [
     BotCommand(command="index", description="Индекс текстом, напр. /index NASDAQ"),
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
     BotCommand(command="news", description="Дайджест новостей: главное + что это значит"),
+    BotCommand(command="ask", description="Задать любой вопрос боту"),
 ]
 
 
