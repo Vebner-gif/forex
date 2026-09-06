@@ -199,6 +199,21 @@ def _fetch_rss_headlines(feeds: list[str], limit: int) -> list[str]:
     return headlines[:limit]
 
 
+def translate_to_ru(texts: list[str]) -> list[str]:
+    """Бесплатный перевод заголовков на русский для fallback-режима (без
+    Claude). Используется только когда ANTHROPIC_API_KEY не настроен —
+    Claude сам прекрасно читает английские заголовки и в переводе не
+    нуждается."""
+    if not texts:
+        return texts
+    try:
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="auto", target="ru").translate_batch(texts)
+    except Exception:
+        logger.exception("Не удалось перевести заголовки, оставляю оригинал")
+        return texts
+
+
 # ---------- Данные по биткоину (реальные цены, не выдумка) ----------
 
 async def fetch_btc_market_data() -> dict:
@@ -424,8 +439,9 @@ async def scheduler_loop() -> None:
                 trigger_at_ny = datetime.combine(ny_now.date(), NYSE_OPEN, tzinfo=NY_TZ) - PRE_NYSE_LEAD
                 if ny_now >= trigger_at_ny and not state["quiet_summary_sent"]:
                     headlines = fetch_recent_headlines()
+                    fallback_headlines = headlines if CLAUDE_ENABLED else translate_to_ru(headlines)
                     fallback = "Важных релизов сегодня нет. Свежие заголовки:\n" + (
-                        "\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков"
+                        "\n".join(f"- {h}" for h in fallback_headlines) or "нет свежих заголовков"
                     )
                     summary = await ask_claude(QUIET_PROMPT.format(
                         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
