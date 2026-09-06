@@ -14,19 +14,25 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
      последних новостных заголовков.
 4. /start подписывает на уведомления и сразу присылает сводку календаря на
    сегодня. Команда /forecast — по запросу короткий прогноз-настроение
-   (бычье/медвежье/нейтральное) по каждой из основных валют, золоту и нефти.
-   Команда /btc — отдельный разбор биткоина с зонами поддержки/сопротивления.
-   Команда /pairs — кнопки с популярными парами (EUR/USD, GBP/USD и т.д.),
-   по нажатию — короткий анализ по этой паре с реальными ценовыми уровнями
-   (ЕЦБ-курсы для фиатных пар, Binance для BTC) и позиционированием крупных
-   трейдеров (COT-отчёты CFTC). Команда /pair EURUSD — то же самое текстом.
+   (бычье/медвежье/нейтральное) по каждой из основных валют, золоту, нефти
+   и индексам (DAX 40, Nasdaq, S&P 500). Команда /btc — отдельный разбор
+   биткоина с зонами поддержки/сопротивления. Команда /pairs — кнопки с
+   популярными парами (EUR/USD, GBP/USD и т.д.), по нажатию — короткий
+   анализ по этой паре с реальными ценовыми уровнями (ЕЦБ-курсы для фиатных
+   пар, Binance для BTC) и позиционированием крупных трейдеров (COT-отчёты
+   CFTC). Команда /pair EURUSD — то же самое текстом. Команда /indices —
+   кнопки DAX 40 / Nasdaq / S&P 500, /index DAX40 — то же текстом. Команда
+   /news — дайджест из двух блоков: «Главное» (что реально произошло, по
+   фактам) и «Что это может значить» (короткий вывод).
 
 Источники данных:
 - Экономический календарь: ForexFactory (нюфид, кэш 15 мин).
 - Новости: ForexLive, FXStreet, Investing.com, DailyFX, TradingEconomics,
-  Oilprice, Kitco + официальные пресс-релизы ФРС, ЕЦБ, Банка Англии.
+  Oilprice, Kitco, MarketWatch, CNBC + официальные пресс-релизы ФРС, ЕЦБ,
+  Банка Англии.
 - Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
 - Цена BTC: Binance (без ключа).
+- Индексы (DAX 40, Nasdaq, S&P 500): Yahoo Finance chart API (без ключа).
 - Позиционирование трейдеров: CFTC Commitment of Traders (публичные данные,
   обновляются раз в неделю, по пятницам).
 
@@ -41,6 +47,10 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    сводка перед NYSE, /forecast) будет пометка, что AI недоступен, и сырые
    данные без интерпретации. Как только ключ появится — просто добавь
    переменную окружения и перезапусти бота, код менять не нужно.
+3. CLAUDE_MODEL      — необязательно, по умолчанию "claude-haiku-4-5-20251001"
+   (дешёвая модель). Чтобы попробовать более сильную — задай в переменных
+   окружения, например "claude-sonnet-4-6". Учти: Sonnet примерно в 3 раза
+   дороже за токен, чем Haiku.
 
 Зависимости (requirements.txt):
     aiogram, aiohttp, feedparser, anthropic
@@ -70,7 +80,7 @@ from anthropic import AsyncAnthropic
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 RSS_FEEDS = [
@@ -90,10 +100,22 @@ CRYPTO_RSS_FEEDS = [
     "https://cointelegraph.com/rss",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
 ]
+EQUITY_RSS_FEEDS = [
+    "https://www.marketwatch.com/rss/topstories",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+]
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"
+
+# Фондовые индексы через Yahoo Finance chart API (бесплатно, без ключа)
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
+INDEX_ASSETS = {
+    "DAX40": {"symbol": "^GDAXI", "label": "DAX 40"},
+    "NASDAQ": {"symbol": "^IXIC", "label": "Nasdaq Composite"},
+    "SP500": {"symbol": "^GSPC", "label": "S&P 500"},
+}
 
 # Курсы фиатных валют (ЕЦБ через Frankfurter.app — бесплатно, без ключа)
 FRANKFURTER_URL = "https://api.frankfurter.app/{start}..{end}"
@@ -242,6 +264,16 @@ def fetch_crypto_headlines(limit: int = 10) -> list[str]:
     return _fetch_rss_headlines(CRYPTO_RSS_FEEDS, limit)
 
 
+def fetch_equity_headlines(limit: int = 10) -> list[str]:
+    return _fetch_rss_headlines(EQUITY_RSS_FEEDS, limit)
+
+
+def fetch_all_headlines(limit: int = 20) -> list[str]:
+    """Объединённый пул для дайджеста новостей: форекс/макро + акции + крипто."""
+    combined = RSS_FEEDS + EQUITY_RSS_FEEDS + CRYPTO_RSS_FEEDS
+    return _fetch_rss_headlines(combined, limit)
+
+
 def _fetch_rss_headlines(feeds: list[str], limit: int) -> list[str]:
     headlines = []
     for url in feeds:
@@ -305,6 +337,44 @@ def format_btc_raw(data: dict) -> str:
         f"Текущая цена: ${data['price']:,.0f} ({data['change_24h']:+.2f}% за 24ч)\n"
         f"Диапазон за 7 дней: ${data['low_7d']:,.0f} – ${data['high_7d']:,.0f}\n"
         f"Диапазон за 30 дней: ${data['low_30d']:,.0f} – ${data['high_30d']:,.0f}"
+    )
+
+
+# ---------- Фондовые индексы (Yahoo Finance, бесплатно, без ключа) ----------
+
+async def fetch_index_data(symbol: str) -> dict:
+    url = YAHOO_CHART_URL.format(symbol=symbol)
+    headers = {"User-Agent": "Mozilla/5.0"}  # Yahoo иногда блокирует запросы без UA
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, timeout=15) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    result = data["chart"]["result"][0]
+    meta = result["meta"]
+    closes = result["indicators"]["quote"][0]["close"]
+    closes = [c for c in closes if c is not None]
+
+    current = meta.get("regularMarketPrice", closes[-1] if closes else 0.0)
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose") or current
+    change_pct = ((current - prev_close) / prev_close * 100) if prev_close else 0.0
+    closes_7d = closes[-7:] if len(closes) >= 7 else closes
+
+    return {
+        "price": current,
+        "change_pct": change_pct,
+        "low_7d": min(closes_7d) if closes_7d else current,
+        "high_7d": max(closes_7d) if closes_7d else current,
+        "low_30d": min(closes) if closes else current,
+        "high_30d": max(closes) if closes else current,
+    }
+
+
+def format_index_raw(label: str, data: dict) -> str:
+    return (
+        f"{label}: {data['price']:,.0f} ({data['change_pct']:+.2f}% за посл. сессию)\n"
+        f"Диапазон за 7 дней: {data['low_7d']:,.0f} – {data['high_7d']:,.0f}\n"
+        f"Диапазон за 30 дней: {data['low_30d']:,.0f} – {data['high_30d']:,.0f}"
     )
 
 
@@ -437,21 +507,22 @@ QUIET_PROMPT = """Ты аналитик форекс и товарных рын�
 Заголовки:
 {headlines}"""
 
-FORECAST_PROMPT = """Ты аналитик форекс и товарных рынков. Вот экономические
-события на сегодня (High/Medium impact) по основным валютам:
+FORECAST_PROMPT = """Ты аналитик форекс, товарных и фондовых рынков. Вот
+экономические события на сегодня (High/Medium impact) по основным валютам:
 {calendar_summary}
 
 Свежие новостные заголовки:
 {headlines}
 
 Дай короткое настроение (бычье/медвежье/нейтральное) по каждой из позиций:
-USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD, Золото (XAU), Нефть (WTI/Brent).
+USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD, Золото (XAU), Нефть (WTI/Brent),
+DAX 40, Nasdaq, S&P 500.
 
 Формат — строго по одной строке на каждую позицию, на русском:
 <эмодзи 📈 или 📉 или ➡️> <Валюта/актив>: <причина в 5-10 слов>
 
 Если по позиции нет значимых факторов сегодня — напиши "нет выраженного драйвера".
-Без вступления, без заключения, без дисклеймеров — только список из 10 строк."""
+Без вступления, без заключения, без дисклеймеров — только список из 13 строк."""
 
 BTC_PROMPT = """Ты крипто-аналитик. Вот реальные рыночные данные по биткоину:
 
@@ -469,6 +540,43 @@ BTC_PROMPT = """Ты крипто-аналитик. Вот реальные ры
 - обязательно заверши фразой, что это не финансовый совет и рынок крайне
   волатилен.
 Никаких общих фраз — только конкретные уровни и суть."""
+
+INDEX_PROMPT = """Ты аналитик фондового рынка. Вот реальные данные по индексу
+{label}:
+
+{raw_data}
+
+Свежие заголовки по рынкам и экономике:
+{headlines}
+
+Напиши короткий анализ по-русски (5-7 предложений):
+- назови 1-2 зоны поддержки и 1-2 зоны сопротивления (в пунктах индекса) на
+  основе диапазонов выше;
+- какие факторы сейчас двигают индекс (ставки ФРС/ЕЦБ, отчётности компаний,
+  макростатистика, геополитика) — если релевантны заголовки, используй их;
+- короткое предположение о вероятном направлении на ближайшие дни;
+- заверши фразой, что это не финансовый совет.
+Без общих фраз — только конкретика."""
+
+NEWS_DIGEST_PROMPT = """Ты финансовый редактор. Вот сырые заголовки за
+последние часы из разных источников (форекс, макро, акции, крипто):
+
+{headlines}
+
+Сделай дайджест по-русски в двух блоках (используй HTML-теги <b> для
+заголовков блоков):
+
+<b>Главное</b>
+4-6 пунктов через тире — просто перескажи своими словами, что реально
+произошло, БЕЗ анализа, только факты по заголовкам (переведи и объедини
+похожие).
+
+<b>Что это может значить</b>
+2-4 предложения — краткий вывод, как это может повлиять на валюты, индексы,
+золото, нефть или крипту.
+
+Если заголовки малозначимы или это в основном шум — так и скажи в конце
+коротко."""
 
 PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная пара: {pair_label}.
 
@@ -634,21 +742,21 @@ async def on_start(message: Message) -> None:
 
 @dp.message(Command("forecast"))
 async def on_forecast(message: Message) -> None:
-    await message.answer("Строю прогноз по валютам, золоту и нефти...")
+    await message.answer("Строю прогноз по валютам, золоту, нефти и индексам...")
     try:
         raw_events = await fetch_calendar()
     except Exception as e:
         await message.answer(f"Не удалось получить календарь: {e}")
         return
     events = filter_today(raw_events, ("High", "Medium"))
-    headlines = fetch_recent_headlines()
+    headlines = fetch_recent_headlines() + fetch_equity_headlines()
     prompt = FORECAST_PROMPT.format(
         calendar_summary=format_calendar_summary(events),
         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
     )
     fallback = format_calendar_summary(events)
     forecast = await ask_claude(prompt, fallback)
-    await message.answer(f"🔮 <b>Быстрый прогноз по валютам</b>\n\n{forecast}", parse_mode="HTML")
+    await message.answer(f"🔮 <b>Быстрый прогноз по рынкам</b>\n\n{forecast}", parse_mode="HTML")
 
 
 @dp.message(Command("btc"))
@@ -694,6 +802,88 @@ async def on_pair(message: Message) -> None:
     await message.answer(f"Собираю анализ по {pair[0]}/{pair[1]}...")
     text = await build_pair_analysis(*pair)
     await message.answer(text, parse_mode="HTML")
+
+
+async def build_index_analysis(key: str) -> str:
+    asset = INDEX_ASSETS[key]
+    data = await fetch_index_data(asset["symbol"])
+    raw_data = format_index_raw(asset["label"], data)
+    headlines = fetch_equity_headlines() + fetch_recent_headlines(limit=6)
+    prompt = INDEX_PROMPT.format(
+        label=asset["label"],
+        raw_data=raw_data,
+        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+    )
+    analysis = await ask_claude(prompt, raw_data)
+    return f"📈 <b>{asset['label']}: {data['price']:,.0f} ({data['change_pct']:+.2f}%)</b>\n\n{analysis}"
+
+
+def indices_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=asset["label"], callback_data=f"index:{key}")
+        for key, asset in INDEX_ASSETS.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+@dp.message(Command("indices"))
+async def on_indices(message: Message) -> None:
+    await message.answer("Выбери индекс:", reply_markup=indices_keyboard())
+
+
+@dp.message(Command("index"))
+async def on_index(message: Message) -> None:
+    parts = message.text.split(maxsplit=1)
+    key = parts[1].strip().upper().replace(" ", "").replace("&", "") if len(parts) > 1 else ""
+    key = {"SP500": "SP500", "S&P500": "SP500", "S&P": "SP500", "DAX": "DAX40", "DAX40": "DAX40",
+           "NASDAQ": "NASDAQ"}.get(key)
+    if key is None:
+        await message.answer(
+            "Укажи индекс: <code>/index DAX40</code>, <code>/index NASDAQ</code> или "
+            "<code>/index SP500</code>. Либо набери /indices — появятся кнопки.",
+            parse_mode="HTML",
+        )
+        return
+    await message.answer(f"Собираю данные по {INDEX_ASSETS[key]['label']}...")
+    try:
+        text = await build_index_analysis(key)
+    except Exception as e:
+        logger.exception("Ошибка анализа индекса")
+        await message.answer(f"Не удалось получить данные: {e}")
+        return
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("index:"))
+async def on_index_callback(callback: CallbackQuery) -> None:
+    key = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if key not in INDEX_ASSETS:
+        return
+    await callback.message.answer(f"Собираю данные по {INDEX_ASSETS[key]['label']}...")
+    try:
+        text = await build_index_analysis(key)
+    except Exception as e:
+        logger.exception("Ошибка анализа индекса")
+        await callback.message.answer(f"Не удалось получить данные: {e}")
+        return
+    await callback.message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("news"))
+async def on_news(message: Message) -> None:
+    await message.answer("Собираю дайджест новостей...")
+    headlines = fetch_all_headlines()
+    if not headlines:
+        await message.answer("Не удалось получить свежие заголовки.")
+        return
+    if CLAUDE_ENABLED:
+        prompt = NEWS_DIGEST_PROMPT.format(headlines="\n".join(f"- {h}" for h in headlines))
+        digest = await ask_claude(prompt, "")
+    else:
+        translated = translate_to_ru(headlines)
+        digest = NO_KEY_NOTICE + "<b>Главное (сырые заголовки)</b>\n" + "\n".join(f"- {h}" for h in translated)
+    await message.answer(f"🗞 <b>Дайджест новостей</b>\n\n{digest}", parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("pair:"))
