@@ -74,7 +74,7 @@ import aiohttp
 import feedparser
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from anthropic import AsyncAnthropic
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
@@ -958,11 +958,24 @@ async def scheduler_loop() -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Подписаться и получить сводку на сегодня"),
+    BotCommand(command="forecast", description="Быстрый прогноз по валютам, золоту, нефти, индексам"),
+    BotCommand(command="pairs", description="Кнопки: анализ по валютной паре"),
+    BotCommand(command="pair", description="Анализ по паре текстом, напр. /pair EURUSD"),
+    BotCommand(command="indices", description="Кнопки: DAX 40 / Nasdaq / S&P 500"),
+    BotCommand(command="index", description="Индекс текстом, напр. /index NASDAQ"),
+    BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
+    BotCommand(command="news", description="Дайджест новостей: главное + что это значит"),
+]
+
+
 async def main() -> None:
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
     if not CLAUDE_ENABLED:
         logger.warning("ANTHROPIC_API_KEY не задан — бот работает без AI-анализа, только сырые данные")
+    await bot.set_my_commands(BOT_COMMANDS)
     asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
 
