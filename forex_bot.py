@@ -17,8 +17,18 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    (бычье/медвежье/нейтральное) по каждой из основных валют, золоту и нефти.
    Команда /btc — отдельный разбор биткоина с зонами поддержки/сопротивления.
    Команда /pairs — кнопки с популярными парами (EUR/USD, GBP/USD и т.д.),
-   по нажатию — короткий анализ по этой паре. Команда /pair EURUSD — то же
-   самое текстом, без кнопок.
+   по нажатию — короткий анализ по этой паре с реальными ценовыми уровнями
+   (ЕЦБ-курсы для фиатных пар, Binance для BTC) и позиционированием крупных
+   трейдеров (COT-отчёты CFTC). Команда /pair EURUSD — то же самое текстом.
+
+Источники данных:
+- Экономический календарь: ForexFactory (нюфид, кэш 15 мин).
+- Новости: ForexLive, FXStreet, Investing.com, DailyFX, TradingEconomics,
+  Oilprice, Kitco + официальные пресс-релизы ФРС, ЕЦБ, Банка Англии.
+- Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
+- Цена BTC: Binance (без ключа).
+- Позиционирование трейдеров: CFTC Commitment of Traders (публичные данные,
+  обновляются раз в неделю, по пятницам).
 
 ВАЖНО: это фоновый процесс, должен работать круглосуточно на чём-то always-on
 (VPS/сервер), не на ноутбуке, который выключается.
@@ -69,6 +79,12 @@ RSS_FEEDS = [
     "https://www.investing.com/rss/news_25.rss",
     "https://oilprice.com/rss/main",
     "https://www.kitco.com/rss/KitcoNews.xml",
+    "https://www.dailyfx.com/feeds/all",
+    "https://tradingeconomics.com/rss/news.aspx",
+    # официальные пресс-релизы центробанков — первичный источник, не пересказ
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+    "https://www.ecb.europa.eu/rss/press.xml",
+    "https://www.bankofengland.co.uk/rss/news",
 ]
 CRYPTO_RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -78,6 +94,22 @@ COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"
+
+# Курсы фиатных валют (ЕЦБ через Frankfurter.app — бесплатно, без ключа)
+FRANKFURTER_URL = "https://api.frankfurter.app/{start}..{end}"
+
+# COT-отчёты CFTC (позиционирование крупных спекулянтов по фьючерсам, раз в неделю)
+COT_DATASET_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+COT_CONTRACT_NAMES = {
+    "EUR": "EURO FX",
+    "GBP": "BRITISH POUND STERLING",
+    "JPY": "JAPANESE YEN",
+    "CHF": "SWISS FRANC",
+    "AUD": "AUSTRALIAN DOLLAR",
+    "CAD": "CANADIAN DOLLAR",
+    "NZD": "NEW ZEALAND DOLLAR",
+}
+COT_CACHE_TTL = timedelta(days=1)
 
 CALENDAR_CACHE_TTL = timedelta(minutes=15)  # чтобы не ловить 429 от ForexFactory
 
@@ -101,6 +133,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _calendar_cache: dict = {"data": None, "fetched_at": None}
+_cot_cache: dict = {}  # currency -> (fetched_at, data)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -275,6 +308,100 @@ def format_btc_raw(data: dict) -> str:
     )
 
 
+# ---------- Реальные курсы фиатных валютных пар (ЕЦБ-данные, бесплатно) ----------
+
+async def fetch_fx_price_data(base: str, quote: str) -> dict | None:
+    """Диапазоны курса за 7/30 дней по официальным дневным курсам ЕЦБ.
+    Работает только для пар из двух фиатных валют (не XAU/BTC)."""
+    if base in ("XAU", "BTC") or quote in ("XAU", "BTC"):
+        return None
+    end = date.today()
+    start = end - timedelta(days=35)
+    url = FRANKFURTER_URL.format(start=start.isoformat(), end=end.isoformat()) + f"?from={base}&to={quote}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=15) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    rates = data.get("rates", {})
+    if not rates:
+        return None
+    sorted_dates = sorted(rates.keys())
+    values = [rates[d][quote] for d in sorted_dates if quote in rates[d]]
+    if not values:
+        return None
+    values_7d = values[-7:] if len(values) >= 7 else values
+
+    return {
+        "current": values[-1],
+        "low_7d": min(values_7d),
+        "high_7d": max(values_7d),
+        "low_30d": min(values),
+        "high_30d": max(values),
+    }
+
+
+def format_fx_raw(data: dict) -> str:
+    return (
+        f"Курс: {data['current']:.4f}\n"
+        f"Диапазон за 7 дней: {data['low_7d']:.4f} – {data['high_7d']:.4f}\n"
+        f"Диапазон за 30 дней: {data['low_30d']:.4f} – {data['high_30d']:.4f}"
+    )
+
+
+# ---------- COT: позиционирование крупных трейдеров (CFTC, раз в неделю) ----------
+
+async def fetch_cot_positioning(currency: str) -> dict | None:
+    """Данные CFTC по фьючерсам на валюту — во сколько лонгов/шортов сидят
+    крупные спекулянты (non-commercial). Обновляется раз в неделю (пятница),
+    поэтому кэшируем на сутки. Для USD/XAU/BTC не считается — нет прямого
+    фьючерса на "доллар" в этом отчёте."""
+    name = COT_CONTRACT_NAMES.get(currency)
+    if not name:
+        return None
+
+    cached = _cot_cache.get(currency)
+    now = datetime.now(timezone.utc)
+    if cached and now - cached[0] < COT_CACHE_TTL:
+        return cached[1]
+
+    params = {
+        "$where": f"market_and_exchange_names like '%{name}%'",
+        "$order": "report_date_as_yyyy_mm_dd DESC",
+        "$limit": "1",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(COT_DATASET_URL, params=params, timeout=15) as resp:
+            resp.raise_for_status()
+            rows = await resp.json()
+    if not rows:
+        return None
+
+    row = rows[0]
+    try:
+        long_pos = int(float(row.get("noncomm_positions_long_all", 0)))
+        short_pos = int(float(row.get("noncomm_positions_short_all", 0)))
+    except (TypeError, ValueError):
+        return None
+
+    result = {
+        "date": row.get("report_date_as_yyyy_mm_dd", "")[:10],
+        "long": long_pos,
+        "short": short_pos,
+        "net": long_pos - short_pos,
+    }
+    _cot_cache[currency] = (now, result)
+    return result
+
+
+def format_cot_raw(currency: str, cot: dict) -> str:
+    bias = "нетто-лонг" if cot["net"] > 0 else "нетто-шорт" if cot["net"] < 0 else "нейтрально"
+    return (
+        f"COT по {currency} ({cot['date']}): крупные спекулянты {bias}, "
+        f"лонги {cot['long']:,}, шорты {cot['short']:,}, нетто {cot['net']:+,}"
+    )
+
+
 # ---------- Генерация прогнозов через Claude ----------
 
 PREDICT_PROMPT = """Ты аналитик форекс-рынка. Через час выходит статистика:
@@ -348,13 +475,22 @@ PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная
 События сегодня по {base}: {base_events}
 События сегодня по {quote}: {quote_events}
 
+Ценовые данные:
+{price_levels}
+
+Позиционирование крупных трейдеров (COT):
+{cot_info}
+
 Свежие новостные заголовки:
 {headlines}
 
-Напиши короткий анализ по-русски (4-6 предложений):
+Напиши короткий анализ по-русски (5-7 предложений):
 - какие факторы сейчас двигают эту пару (если факторов нет — так и скажи);
 - в чью пользу они складываются ({base} или {quote}), в виде вероятного
   направления пары;
+- если есть ценовые диапазоны — назови зону поддержки и зону сопротивления;
+- если есть данные COT — упомяни, совпадает ли позиционирование крупных
+  игроков с направлением факторов выше или противоречит ему;
 - на что обратить внимание в ближайшие часы/дни.
 Без общих фраз и дисклеймеров, только суть."""
 
@@ -422,28 +558,51 @@ async def build_pair_analysis(base: str, quote: str) -> str:
     base_events = events_summary_for(events, base)
     quote_events = events_summary_for(events, quote)
 
-    btc_note = ""
+    price_notes = []
     if "BTC" in (base, quote):
         try:
             btc_data = await fetch_btc_market_data()
-            btc_note = "\n" + format_btc_raw(btc_data)
+            price_notes.append(format_btc_raw(btc_data))
         except Exception:
             logger.exception("Не удалось получить данные BTC для анализа пары")
+    else:
+        try:
+            fx_data = await fetch_fx_price_data(base, quote)
+            if fx_data:
+                price_notes.append(format_fx_raw(fx_data))
+        except Exception:
+            logger.exception("Не удалось получить курс для пары")
+
+    cot_notes = []
+    for ccy in (base, quote):
+        try:
+            cot = await fetch_cot_positioning(ccy)
+        except Exception:
+            logger.exception(f"Не удалось получить COT для {ccy}")
+            cot = None
+        if cot:
+            cot_notes.append(format_cot_raw(ccy, cot))
 
     headlines = fetch_crypto_headlines() if "BTC" in (base, quote) else fetch_recent_headlines()
+
+    price_levels_text = "\n".join(price_notes) or "нет данных по цене"
+    cot_text = "\n".join(cot_notes) or "нет данных по позиционированию"
 
     prompt = PAIR_PROMPT.format(
         pair_label=pair_label,
         base=base,
         quote=quote,
-        base_events=base_events + btc_note if base == "BTC" else base_events,
-        quote_events=quote_events + btc_note if quote == "BTC" else quote_events,
+        base_events=base_events,
+        quote_events=quote_events,
+        price_levels=price_levels_text,
+        cot_info=cot_text,
         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
     )
     fallback = (
         f"По {base}: {base_events}\n"
-        f"По {quote}: {quote_events}"
-        + (btc_note if btc_note else "")
+        f"По {quote}: {quote_events}\n"
+        f"{price_levels_text}\n"
+        f"{cot_text}"
     )
     analysis = await ask_claude(prompt, fallback)
     return f"💱 <b>{pair_label}</b>\n\n{analysis}"
