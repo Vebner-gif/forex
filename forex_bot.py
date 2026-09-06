@@ -20,8 +20,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    популярными парами (EUR/USD, GBP/USD и т.д.), по нажатию — короткий
    анализ по этой паре с реальными ценовыми уровнями (ЕЦБ-курсы для фиатных
    пар, Binance для BTC) и позиционированием крупных трейдеров (COT-отчёты
-   CFTC). Команда /indices —
-   кнопки DAX 40 / Nasdaq / S&P 500, /index DAX40 — то же текстом. Команда
+   CFTC). Команда /indices — кнопки DAX 40 / Nasdaq / S&P 500. Команда
    /news — дайджест из двух блоков: «Главное» (что реально произошло, по
    фактам) и «Что это может значить» (короткий вывод). Команда /ask <вопрос>
    или просто обычное сообщение без команды — бот ответит на любой вопрос
@@ -119,7 +118,7 @@ BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=100"
 
 # Фондовые индексы через Yahoo Finance chart API (бесплатно, без ключа)
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
 INDEX_ASSETS = {
     "DAX40": {"symbol": "^GDAXI", "label": "DAX 40"},
     "NASDAQ": {"symbol": "^IXIC", "label": "Nasdaq Composite"},
@@ -403,11 +402,12 @@ async def fetch_btc_market_data() -> dict:
 
 
 def format_btc_raw(data: dict) -> str:
-    return (
+    base = (
         f"Текущая цена: ${data['price']:,.0f} ({data['change_24h']:+.2f}% за 24ч)\n"
         f"Диапазон за 7 дней: ${data['low_7d']:,.0f} – ${data['high_7d']:,.0f}\n"
         f"Диапазон за 30 дней: ${data['low_30d']:,.0f} – ${data['high_30d']:,.0f}"
     )
+    return base + "\n" + format_technicals(data, decimals=0)
 
 
 # ---------- Фондовые индексы (Yahoo Finance, бесплатно, без ключа) ----------
@@ -429,34 +429,38 @@ async def fetch_index_data(symbol: str) -> dict:
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose") or current
     change_pct = ((current - prev_close) / prev_close * 100) if prev_close else 0.0
     closes_7d = closes[-7:] if len(closes) >= 7 else closes
+    closes_30 = closes[-30:] if len(closes) >= 30 else closes
 
     return {
         "price": current,
         "change_pct": change_pct,
         "low_7d": min(closes_7d) if closes_7d else current,
         "high_7d": max(closes_7d) if closes_7d else current,
-        "low_30d": min(closes) if closes else current,
-        "high_30d": max(closes) if closes else current,
+        "low_30d": min(closes_30) if closes_30 else current,
+        "high_30d": max(closes_30) if closes_30 else current,
+        **compute_technicals(closes),
     }
 
 
 def format_index_raw(label: str, data: dict) -> str:
-    return (
+    base = (
         f"{label}: {data['price']:,.0f} ({data['change_pct']:+.2f}% за посл. сессию)\n"
         f"Диапазон за 7 дней: {data['low_7d']:,.0f} – {data['high_7d']:,.0f}\n"
         f"Диапазон за 30 дней: {data['low_30d']:,.0f} – {data['high_30d']:,.0f}"
     )
+    return base + "\n" + format_technicals(data, decimals=0)
 
 
 # ---------- Реальные курсы фиатных валютных пар (ЕЦБ-данные, бесплатно) ----------
 
 async def fetch_fx_price_data(base: str, quote: str) -> dict | None:
-    """Диапазоны курса за 7/30 дней по официальным дневным курсам ЕЦБ.
-    Работает только для пар из двух фиатных валют (не XAU/BTC)."""
+    """Курс + технические индикаторы по официальным дневным курсам ЕЦБ.
+    Работает только для пар из двух фиатных валют (не XAU/BTC). Берём ~4
+    месяца (ЕЦБ публикует только по рабочим дням) — с запасом для MA50."""
     if base in ("XAU", "BTC") or quote in ("XAU", "BTC"):
         return None
     end = date.today()
-    start = end - timedelta(days=35)
+    start = end - timedelta(days=120)
     url = FRANKFURTER_URL.format(start=start.isoformat(), end=end.isoformat()) + f"?from={base}&to={quote}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=15) as resp:
@@ -471,22 +475,25 @@ async def fetch_fx_price_data(base: str, quote: str) -> dict | None:
     if not values:
         return None
     values_7d = values[-7:] if len(values) >= 7 else values
+    values_30 = values[-30:] if len(values) >= 30 else values
 
     return {
         "current": values[-1],
         "low_7d": min(values_7d),
         "high_7d": max(values_7d),
-        "low_30d": min(values),
-        "high_30d": max(values),
+        "low_30d": min(values_30),
+        "high_30d": max(values_30),
+        **compute_technicals(values),
     }
 
 
 def format_fx_raw(data: dict) -> str:
-    return (
+    base = (
         f"Курс: {data['current']:.4f}\n"
         f"Диапазон за 7 дней: {data['low_7d']:.4f} – {data['high_7d']:.4f}\n"
         f"Диапазон за 30 дней: {data['low_30d']:.4f} – {data['high_30d']:.4f}"
     )
+    return base + "\n" + format_technicals(data, decimals=4)
 
 
 # ---------- COT: позиционирование крупных трейдеров (CFTC, раз в неделю) ----------
@@ -594,39 +601,56 @@ DAX 40, Nasdaq, S&P 500.
 Если по позиции нет значимых факторов сегодня — напиши "нет выраженного драйвера".
 Без вступления, без заключения, без дисклеймеров — только список из 13 строк."""
 
-BTC_PROMPT = """Ты крипто-аналитик. Вот реальные рыночные данные по биткоину:
+SCENARIO_BLOCK = """
+После анализа обязательно добавь блок:
+
+<b>Возможный сценарий</b>
+На основе RSI, MA20/MA50 и уровней поддержки/сопротивления определи, какой
+сценарий сейчас выглядит более обоснованным — лонг или шорт (или "сигналы
+противоречивы" если RSI и тренд MA спорят друг с другом, тогда опиши оба
+кратко). Для основного сценария укажи:
+- Направление: лонг или шорт
+- Точка входа: ~уровень
+- Стоп-лосс: ~уровень
+- Тейк-профит: ~уровень
+- Обоснование: одно предложение (что из RSI/MA/уровней на это указывает)
+
+Это иллюстративный технический расклад, а не гарантированный сигнал — так и
+пометь. Заверши фразой, что это не финансовый совет."""
+
+BTC_PROMPT = """Ты крипто-аналитик. Вот реальные рыночные данные по биткоину
+(включая RSI и скользящие средние):
 
 {raw_data}
 
 Свежие крипто-новостные заголовки:
 {headlines}
 
-Напиши короткий спекулятивный анализ по-русски (5-7 предложений):
+Напиши короткий спекулятивный анализ по-русски (4-5 предложений):
 - назови 2-3 конкретные зоны поддержки (в USD) на основе диапазонов выше и
   ближайших круглых психологических уровней;
 - назови 2-3 конкретные зоны сопротивления (в USD) по той же логике;
 - короткое предположение о вероятном направлении на ближайшие дни с учётом
-  динамики 24ч/7д/30д и релевантных заголовков (если такие есть);
-- обязательно заверши фразой, что это не финансовый совет и рынок крайне
-  волатилен.
-Никаких общих фраз — только конкретные уровни и суть."""
+  RSI, MA20/MA50 и релевантных заголовков (если такие есть).
+Никаких общих фраз — только конкретные уровни и суть.
+""" + SCENARIO_BLOCK
 
 INDEX_PROMPT = """Ты аналитик фондового рынка. Вот реальные данные по индексу
-{label}:
+{label} (включая RSI и скользящие средние):
 
 {raw_data}
 
 Свежие заголовки по рынкам и экономике:
 {headlines}
 
-Напиши короткий анализ по-русски (5-7 предложений):
+Напиши короткий анализ по-русски (4-5 предложений):
 - назови 1-2 зоны поддержки и 1-2 зоны сопротивления (в пунктах индекса) на
   основе диапазонов выше;
 - какие факторы сейчас двигают индекс (ставки ФРС/ЕЦБ, отчётности компаний,
   макростатистика, геополитика) — если релевантны заголовки, используй их;
-- короткое предположение о вероятном направлении на ближайшие дни;
-- заверши фразой, что это не финансовый совет.
-Без общих фраз — только конкретика."""
+- короткое предположение о вероятном направлении с учётом RSI и MA20/MA50.
+Без общих фраз — только конкретика.
+""" + SCENARIO_BLOCK
 
 NEWS_DIGEST_PROMPT = """Ты финансовый редактор. Вот сырые заголовки за
 последние часы из разных источников (форекс, макро, акции, крипто):
@@ -670,7 +694,8 @@ PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная
 События сегодня по {base}: {base_events}
 События сегодня по {quote}: {quote_events}
 
-Ценовые данные:
+Ценовые данные и технические индикаторы (RSI, MA20/MA50 считаются от {base}
+относительно {quote}, чем выше — тем сильнее {base}):
 {price_levels}
 
 Позиционирование крупных трейдеров (COT):
@@ -679,15 +704,13 @@ PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная
 Свежие новостные заголовки:
 {headlines}
 
-Напиши короткий анализ по-русски (5-7 предложений):
+Напиши короткий анализ по-русски (4-5 предложений):
 - какие факторы сейчас двигают эту пару (если факторов нет — так и скажи);
-- в чью пользу они складываются ({base} или {quote}), в виде вероятного
-  направления пары;
-- если есть ценовые диапазоны — назови зону поддержки и зону сопротивления;
+- в чью пользу они складываются ({base} или {quote}), с учётом RSI и MA20/MA50;
 - если есть данные COT — упомяни, совпадает ли позиционирование крупных
-  игроков с направлением факторов выше или противоречит ему;
-- на что обратить внимание в ближайшие часы/дни.
-Без общих фраз и дисклеймеров, только суть."""
+  игроков с направлением факторов выше или противоречит ему.
+Без общих фраз и дисклеймеров.
+""" + SCENARIO_BLOCK
 
 
 NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
@@ -913,29 +936,6 @@ async def on_indices(message: Message) -> None:
     await message.answer("Выбери индекс:", reply_markup=indices_keyboard())
 
 
-@dp.message(Command("index"))
-async def on_index(message: Message) -> None:
-    parts = message.text.split(maxsplit=1)
-    key = parts[1].strip().upper().replace(" ", "").replace("&", "") if len(parts) > 1 else ""
-    key = {"SP500": "SP500", "S&P500": "SP500", "S&P": "SP500", "DAX": "DAX40", "DAX40": "DAX40",
-           "NASDAQ": "NASDAQ"}.get(key)
-    if key is None:
-        await message.answer(
-            "Укажи индекс: <code>/index DAX40</code>, <code>/index NASDAQ</code> или "
-            "<code>/index SP500</code>. Либо набери /indices — появятся кнопки.",
-            parse_mode="HTML",
-        )
-        return
-    await message.answer(f"Собираю данные по {INDEX_ASSETS[key]['label']}...")
-    try:
-        text = await build_index_analysis(key)
-    except Exception as e:
-        logger.exception("Ошибка анализа индекса")
-        await message.answer(f"Не удалось получить данные: {e}")
-        return
-    await message.answer(text, parse_mode="HTML")
-
-
 @dp.callback_query(F.data.startswith("index:"))
 async def on_index_callback(callback: CallbackQuery) -> None:
     key = callback.data.split(":", 1)[1]
@@ -968,19 +968,22 @@ async def on_news(message: Message) -> None:
     await message.answer(f"🗞 <b>Дайджест новостей</b>\n\n{digest}", parse_mode="HTML")
 
 
-async def gather_asset_context(question: str) -> str:
+async def gather_asset_context(question: str) -> tuple[str, list[str]]:
     """Если в вопросе упоминается конкретный актив (BTC, индекс, валютная
     пара) — подтягиваем по нему реальные цифры, чтобы Claude не отвечал
-    "у меня нет доступа к текущим данным", хотя данные у бота есть."""
+    "у меня нет доступа к текущим данным", хотя данные у бота есть.
+    Возвращает (собранный текст, список ошибок получения данных)."""
     q = question.lower()
     parts = []
+    errors = []
 
     if any(k in q for k in ("btc", "биткоин", "битко", "bitcoin")):
         try:
             data = await fetch_btc_market_data()
             parts.append("Биткоин (реальные данные):\n" + format_btc_raw(data))
-        except Exception:
+        except Exception as e:
             logger.exception("Не удалось получить BTC для /ask")
+            errors.append(f"BTC: {e}")
 
     index_map = [
         (("dax",), "DAX40"),
@@ -997,8 +1000,9 @@ async def gather_asset_context(question: str) -> str:
                 asset = INDEX_ASSETS[key]
                 data = await fetch_index_data(asset["symbol"])
                 parts.append(f"{asset['label']} (реальные данные):\n" + format_index_raw(asset["label"], data))
-            except Exception:
+            except Exception as e:
                 logger.exception(f"Не удалось получить индекс {key} для /ask")
+                errors.append(f"{key}: {e}")
 
     match = re.search(r"\b([a-zA-Z]{3})\s*/?\s*([a-zA-Z]{3})\b", question)
     if match:
@@ -1008,17 +1012,23 @@ async def gather_asset_context(question: str) -> str:
                 fx = await fetch_fx_price_data(*pair)
                 if fx:
                     parts.append(f"{pair[0]}/{pair[1]} (реальный курс):\n" + format_fx_raw(fx))
-            except Exception:
+            except Exception as e:
                 logger.exception("Не удалось получить курс пары для /ask")
+                errors.append(f"{pair[0]}/{pair[1]}: {e}")
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), errors
 
 
 async def answer_question(message: Message, question: str) -> None:
     if not question.strip():
         await message.answer("Напиши вопрос после команды, например: /ask что будет с долларом на этой неделе?")
         return
-    asset_data = await gather_asset_context(question)
+    asset_data, errors = await gather_asset_context(question)
+    if errors and not asset_data:
+        # актив распознан, но получить данные не удалось — говорим прямо,
+        # а не позволяем Claude придумывать "у меня нет доступа"
+        await message.answer("Не удалось получить актуальные данные: " + "; ".join(errors))
+        return
     headlines = fetch_recent_headlines(limit=8)
     prompt = ASK_PROMPT.format(
         asset_data=asset_data or "нет данных по конкретному активу — вопрос, видимо, не о цене конкретного инструмента",
@@ -1125,7 +1135,6 @@ BOT_COMMANDS = [
     BotCommand(command="forecast", description="Быстрый прогноз по валютам, золоту, нефти, индексам"),
     BotCommand(command="pairs", description="Кнопки: анализ по валютной паре"),
     BotCommand(command="indices", description="Кнопки: DAX 40 / Nasdaq / S&P 500"),
-    BotCommand(command="index", description="Индекс текстом, напр. /index NASDAQ"),
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
     BotCommand(command="news", description="Дайджест новостей: главное + что это значит"),
     BotCommand(command="ask", description="Задать любой вопрос боту"),
