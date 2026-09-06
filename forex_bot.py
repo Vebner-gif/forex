@@ -20,7 +20,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    популярными парами (EUR/USD, GBP/USD и т.д.), по нажатию — короткий
    анализ по этой паре с реальными ценовыми уровнями (ЕЦБ-курсы для фиатных
    пар, Binance для BTC) и позиционированием крупных трейдеров (COT-отчёты
-   CFTC). Команда /pair EURUSD — то же самое текстом. Команда /indices —
+   CFTC). Команда /indices —
    кнопки DAX 40 / Nasdaq / S&P 500, /index DAX40 — то же текстом. Команда
    /news — дайджест из двух блоков: «Главное» (что реально произошло, по
    фактам) и «Что это может значить» (короткий вывод).
@@ -785,25 +785,6 @@ async def on_pairs(message: Message) -> None:
     await message.answer("Выбери пару:", reply_markup=pairs_keyboard())
 
 
-@dp.message(Command("pair"))
-async def on_pair(message: Message) -> None:
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer(
-            "Укажи пару, например: <code>/pair EURUSD</code> или <code>/pair GBP/USD</code>.\n"
-            "Либо набери /pairs — появятся кнопки.",
-            parse_mode="HTML",
-        )
-        return
-    pair = parse_pair(parts[1])
-    if pair is None:
-        await message.answer("Не распознал пару. Пример: <code>/pair EURUSD</code>", parse_mode="HTML")
-        return
-    await message.answer(f"Собираю анализ по {pair[0]}/{pair[1]}...")
-    text = await build_pair_analysis(*pair)
-    await message.answer(text, parse_mode="HTML")
-
-
 async def build_index_analysis(key: str) -> str:
     asset = INDEX_ASSETS[key]
     data = await fetch_index_data(asset["symbol"])
@@ -962,7 +943,6 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Подписаться и получить сводку на сегодня"),
     BotCommand(command="forecast", description="Быстрый прогноз по валютам, золоту, нефти, индексам"),
     BotCommand(command="pairs", description="Кнопки: анализ по валютной паре"),
-    BotCommand(command="pair", description="Анализ по паре текстом, напр. /pair EURUSD"),
     BotCommand(command="indices", description="Кнопки: DAX 40 / Nasdaq / S&P 500"),
     BotCommand(command="index", description="Индекс текстом, напр. /index NASDAQ"),
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
