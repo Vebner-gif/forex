@@ -66,6 +66,12 @@ RSS_FEEDS = [
     "https://oilprice.com/rss/main",
     "https://www.kitco.com/rss/KitcoNews.xml",
 ]
+CRYPTO_RSS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+]
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
 
 MAJOR_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
 IMPACT_EMOJI = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Holiday": "⚪️"}
@@ -175,14 +181,56 @@ def format_calendar_summary(events: list[dict]) -> str:
 # ---------- Новости (контекст для прогнозов) ----------
 
 def fetch_recent_headlines(limit: int = 12) -> list[str]:
+    return _fetch_rss_headlines(RSS_FEEDS, limit)
+
+
+def fetch_crypto_headlines(limit: int = 10) -> list[str]:
+    return _fetch_rss_headlines(CRYPTO_RSS_FEEDS, limit)
+
+
+def _fetch_rss_headlines(feeds: list[str], limit: int) -> list[str]:
     headlines = []
-    for url in RSS_FEEDS:
+    for url in feeds:
         try:
             feed = feedparser.parse(url)
             headlines.extend(e.get("title", "") for e in feed.entries[:8])
         except Exception:
             logger.exception(f"Не удалось прочитать RSS: {url}")
     return headlines[:limit]
+
+
+# ---------- Данные по биткоину (реальные цены, не выдумка) ----------
+
+async def fetch_btc_market_data() -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(COINGECKO_PRICE_URL, timeout=15) as resp:
+            resp.raise_for_status()
+            price_data = await resp.json()
+        async with session.get(COINGECKO_CHART_URL, timeout=15) as resp:
+            resp.raise_for_status()
+            chart_data = await resp.json()
+
+    current_price = price_data["bitcoin"]["usd"]
+    change_24h = price_data["bitcoin"].get("usd_24h_change", 0.0)
+    prices = [p[1] for p in chart_data.get("prices", [])]
+    prices_7d = prices[-7:] if len(prices) >= 7 else prices
+
+    return {
+        "price": current_price,
+        "change_24h": change_24h,
+        "low_7d": min(prices_7d) if prices_7d else current_price,
+        "high_7d": max(prices_7d) if prices_7d else current_price,
+        "low_30d": min(prices) if prices else current_price,
+        "high_30d": max(prices) if prices else current_price,
+    }
+
+
+def format_btc_raw(data: dict) -> str:
+    return (
+        f"Текущая цена: ${data['price']:,.0f} ({data['change_24h']:+.2f}% за 24ч)\n"
+        f"Диапазон за 7 дней: ${data['low_7d']:,.0f} – ${data['high_7d']:,.0f}\n"
+        f"Диапазон за 30 дней: ${data['low_30d']:,.0f} – ${data['high_30d']:,.0f}"
+    )
 
 
 # ---------- Генерация прогнозов через Claude ----------
@@ -235,6 +283,23 @@ USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD, Золото (XAU), Нефть (WTI/Bren
 
 Если по позиции нет значимых факторов сегодня — напиши "нет выраженного драйвера".
 Без вступления, без заключения, без дисклеймеров — только список из 10 строк."""
+
+BTC_PROMPT = """Ты крипто-аналитик. Вот реальные рыночные данные по биткоину:
+
+{raw_data}
+
+Свежие крипто-новостные заголовки:
+{headlines}
+
+Напиши короткий спекулятивный анализ по-русски (5-7 предложений):
+- назови 2-3 конкретные зоны поддержки (в USD) на основе диапазонов выше и
+  ближайших круглых психологических уровней;
+- назови 2-3 конкретные зоны сопротивления (в USD) по той же логике;
+- короткое предположение о вероятном направлении на ближайшие дни с учётом
+  динамики 24ч/7д/30д и релевантных заголовков (если такие есть);
+- обязательно заверши фразой, что это не финансовый совет и рынок крайне
+  волатилен.
+Никаких общих фраз — только конкретные уровни и суть."""
 
 
 NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
@@ -297,6 +362,25 @@ async def on_forecast(message: Message) -> None:
     fallback = format_calendar_summary(events)
     forecast = await ask_claude(prompt, fallback)
     await message.answer(f"🔮 <b>Быстрый прогноз по валютам</b>\n\n{forecast}", parse_mode="HTML")
+
+
+@dp.message(Command("btc"))
+async def on_btc(message: Message) -> None:
+    await message.answer("Собираю данные по биткоину...")
+    try:
+        data = await fetch_btc_market_data()
+    except Exception as e:
+        await message.answer(f"Не удалось получить данные по BTC: {e}")
+        return
+    headlines = fetch_crypto_headlines()
+    raw_data = format_btc_raw(data)
+    prompt = BTC_PROMPT.format(
+        raw_data=raw_data,
+        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+    )
+    analysis = await ask_claude(prompt, raw_data)
+    text = f"₿ <b>Биткоин: ${data['price']:,.0f} ({data['change_24h']:+.2f}% 24ч)</b>\n\n{analysis}"
+    await message.answer(text, parse_mode="HTML")
 
 
 # ---------- Планировщик ----------
