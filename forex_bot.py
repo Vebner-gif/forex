@@ -15,6 +15,10 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
 4. /start подписывает на уведомления и сразу присылает сводку календаря на
    сегодня. Команда /forecast — по запросу короткий прогноз-настроение
    (бычье/медвежье/нейтральное) по каждой из основных валют, золоту и нефти.
+   Команда /btc — отдельный разбор биткоина с зонами поддержки/сопротивления.
+   Команда /pairs — кнопки с популярными парами (EUR/USD, GBP/USD и т.д.),
+   по нажатию — короткий анализ по этой паре. Команда /pair EURUSD — то же
+   самое текстом, без кнопок.
 
 ВАЖНО: это фоновый процесс, должен работать круглосуточно на чём-то always-on
 (VPS/сервер), не на ноутбуке, который выключается.
@@ -48,9 +52,9 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import feedparser
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from anthropic import AsyncAnthropic
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
@@ -72,9 +76,16 @@ CRYPTO_RSS_FEEDS = [
 ]
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"
+
+CALENDAR_CACHE_TTL = timedelta(minutes=15)  # чтобы не ловить 429 от ForexFactory
 
 MAJOR_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
 IMPACT_EMOJI = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Holiday": "⚪️"}
+
+# Популярные пары для /pairs (кнопки) и /pair (текстом)
+POPULAR_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "XAUUSD", "BTCUSD"]
 
 NY_TZ = ZoneInfo("America/New_York")
 NYSE_OPEN = time(9, 30)
@@ -88,6 +99,8 @@ STATE_FILE = DATA_DIR / "daily_state.json"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_calendar_cache: dict = {"data": None, "fetched_at": None}
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -140,10 +153,18 @@ def parse_event_time(raw: str):
 
 
 async def fetch_calendar() -> list[dict]:
+    """Кэшируем на CALENDAR_CACHE_TTL, чтобы частые /start и планировщик не
+    ловили 429 Too Many Requests от ForexFactory."""
+    now = datetime.now(timezone.utc)
+    if _calendar_cache["data"] is not None and now - _calendar_cache["fetched_at"] < CALENDAR_CACHE_TTL:
+        return _calendar_cache["data"]
     async with aiohttp.ClientSession() as session:
         async with session.get(CALENDAR_URL, timeout=15) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            data = await resp.json()
+    _calendar_cache["data"] = data
+    _calendar_cache["fetched_at"] = now
+    return data
 
 
 def filter_today(events: list[dict], impacts: tuple[str, ...]) -> list[dict]:
@@ -217,26 +238,32 @@ def translate_to_ru(texts: list[str]) -> list[str]:
 # ---------- Данные по биткоину (реальные цены, не выдумка) ----------
 
 async def fetch_btc_market_data() -> dict:
+    """Binance вместо CoinGecko: не требует ключа и заметно реже блокирует
+    облачные IP (Railway/Render и т.п.)."""
     async with aiohttp.ClientSession() as session:
-        async with session.get(COINGECKO_PRICE_URL, timeout=15) as resp:
+        async with session.get(BINANCE_TICKER_URL, timeout=15) as resp:
             resp.raise_for_status()
-            price_data = await resp.json()
-        async with session.get(COINGECKO_CHART_URL, timeout=15) as resp:
+            ticker = await resp.json()
+        async with session.get(BINANCE_KLINES_URL, timeout=15) as resp:
             resp.raise_for_status()
-            chart_data = await resp.json()
+            klines = await resp.json()
 
-    current_price = price_data["bitcoin"]["usd"]
-    change_24h = price_data["bitcoin"].get("usd_24h_change", 0.0)
-    prices = [p[1] for p in chart_data.get("prices", [])]
-    prices_7d = prices[-7:] if len(prices) >= 7 else prices
+    current_price = float(ticker["lastPrice"])
+    change_24h = float(ticker["priceChangePercent"])
+
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    klines_7d = klines[-7:] if len(klines) >= 7 else klines
+    highs_7d = [float(k[2]) for k in klines_7d]
+    lows_7d = [float(k[3]) for k in klines_7d]
 
     return {
         "price": current_price,
         "change_24h": change_24h,
-        "low_7d": min(prices_7d) if prices_7d else current_price,
-        "high_7d": max(prices_7d) if prices_7d else current_price,
-        "low_30d": min(prices) if prices else current_price,
-        "high_30d": max(prices) if prices else current_price,
+        "low_7d": min(lows_7d) if lows_7d else current_price,
+        "high_7d": max(highs_7d) if highs_7d else current_price,
+        "low_30d": min(lows) if lows else current_price,
+        "high_30d": max(highs) if highs else current_price,
     }
 
 
@@ -316,6 +343,21 @@ BTC_PROMPT = """Ты крипто-аналитик. Вот реальные ры
   волатилен.
 Никаких общих фраз — только конкретные уровни и суть."""
 
+PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная пара: {pair_label}.
+
+События сегодня по {base}: {base_events}
+События сегодня по {quote}: {quote_events}
+
+Свежие новостные заголовки:
+{headlines}
+
+Напиши короткий анализ по-русски (4-6 предложений):
+- какие факторы сейчас двигают эту пару (если факторов нет — так и скажи);
+- в чью пользу они складываются ({base} или {quote}), в виде вероятного
+  направления пары;
+- на что обратить внимание в ближайшие часы/дни.
+Без общих фраз и дисклеймеров, только суть."""
+
 
 NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
 
@@ -343,6 +385,77 @@ async def send_to_subscribers(text: str) -> None:
             await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             logger.exception(f"Не удалось отправить сообщение в {chat_id}")
+
+
+# ---------- Анализ по конкретной валютной паре ----------
+
+def parse_pair(raw: str) -> tuple[str, str] | None:
+    """Принимает 'EURUSD', 'EUR/USD', 'eur usd' и т.п., возвращает (base, quote)."""
+    cleaned = raw.strip().upper().replace("/", "").replace(" ", "").replace("-", "")
+    if len(cleaned) != 6:
+        return None
+    base, quote = cleaned[:3], cleaned[3:]
+    known = MAJOR_CURRENCIES | {"XAU", "BTC"}
+    if base not in known or quote not in known:
+        return None
+    return base, quote
+
+
+def events_summary_for(events: list[dict], currency: str) -> str:
+    relevant = [e for e in events if e.get("country") == currency]
+    if not relevant:
+        return "нет значимых событий сегодня"
+    parts = []
+    for e in relevant:
+        parts.append(f"{e.get('title')} (прогноз {e.get('forecast') or '—'}, пред. {e.get('previous') or '—'})")
+    return "; ".join(parts)
+
+
+async def build_pair_analysis(base: str, quote: str) -> str:
+    pair_label = f"{base}/{quote}"
+    try:
+        raw_events = await fetch_calendar()
+        events = filter_today(raw_events, ("High", "Medium"))
+    except Exception:
+        events = []
+
+    base_events = events_summary_for(events, base)
+    quote_events = events_summary_for(events, quote)
+
+    btc_note = ""
+    if "BTC" in (base, quote):
+        try:
+            btc_data = await fetch_btc_market_data()
+            btc_note = "\n" + format_btc_raw(btc_data)
+        except Exception:
+            logger.exception("Не удалось получить данные BTC для анализа пары")
+
+    headlines = fetch_crypto_headlines() if "BTC" in (base, quote) else fetch_recent_headlines()
+
+    prompt = PAIR_PROMPT.format(
+        pair_label=pair_label,
+        base=base,
+        quote=quote,
+        base_events=base_events + btc_note if base == "BTC" else base_events,
+        quote_events=quote_events + btc_note if quote == "BTC" else quote_events,
+        headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+    )
+    fallback = (
+        f"По {base}: {base_events}\n"
+        f"По {quote}: {quote_events}"
+        + (btc_note if btc_note else "")
+    )
+    analysis = await ask_claude(prompt, fallback)
+    return f"💱 <b>{pair_label}</b>\n\n{analysis}"
+
+
+def pairs_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=f"{p[:3]}/{p[3:]}", callback_data=f"pair:{p}")
+        for p in POPULAR_PAIRS
+    ]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------- Хендлеры бота ----------
@@ -381,10 +494,12 @@ async def on_forecast(message: Message) -> None:
 
 @dp.message(Command("btc"))
 async def on_btc(message: Message) -> None:
+    logger.info(f"/btc от {message.chat.id}")
     await message.answer("Собираю данные по биткоину...")
     try:
         data = await fetch_btc_market_data()
     except Exception as e:
+        logger.exception("Ошибка получения данных BTC")
         await message.answer(f"Не удалось получить данные по BTC: {e}")
         return
     headlines = fetch_crypto_headlines()
@@ -396,6 +511,42 @@ async def on_btc(message: Message) -> None:
     analysis = await ask_claude(prompt, raw_data)
     text = f"₿ <b>Биткоин: ${data['price']:,.0f} ({data['change_24h']:+.2f}% 24ч)</b>\n\n{analysis}"
     await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("pairs"))
+async def on_pairs(message: Message) -> None:
+    await message.answer("Выбери пару:", reply_markup=pairs_keyboard())
+
+
+@dp.message(Command("pair"))
+async def on_pair(message: Message) -> None:
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи пару, например: <code>/pair EURUSD</code> или <code>/pair GBP/USD</code>.\n"
+            "Либо набери /pairs — появятся кнопки.",
+            parse_mode="HTML",
+        )
+        return
+    pair = parse_pair(parts[1])
+    if pair is None:
+        await message.answer("Не распознал пару. Пример: <code>/pair EURUSD</code>", parse_mode="HTML")
+        return
+    await message.answer(f"Собираю анализ по {pair[0]}/{pair[1]}...")
+    text = await build_pair_analysis(*pair)
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("pair:"))
+async def on_pair_callback(callback: CallbackQuery) -> None:
+    code = callback.data.split(":", 1)[1]
+    pair = parse_pair(code)
+    await callback.answer()
+    if pair is None:
+        return
+    await callback.message.answer(f"Собираю анализ по {pair[0]}/{pair[1]}...")
+    text = await build_pair_analysis(*pair)
+    await callback.message.answer(text, parse_mode="HTML")
 
 
 # ---------- Планировщик ----------
