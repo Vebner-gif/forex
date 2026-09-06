@@ -2,3 +2,4 @@ aiogram>=3.0,<4.0
 aiohttp>=3.9
 feedparser>=6.0
 anthropic>=0.40
+deep-translator>=1.11
