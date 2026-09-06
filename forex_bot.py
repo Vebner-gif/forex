@@ -74,6 +74,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -115,7 +116,7 @@ EQUITY_RSS_FEEDS = [
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=100"
 
 # Фондовые индексы через Yahoo Finance chart API (бесплатно, без ключа)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
@@ -308,11 +309,68 @@ def translate_to_ru(texts: list[str]) -> list[str]:
         return texts
 
 
+# ---------- Технические индикаторы (считаем сами, без сторонних либ) ----------
+
+def compute_rsi(closes: list[float], period: int = 14) -> float | None:
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    recent = deltas[-period:]
+    gains = [d for d in recent if d > 0]
+    losses = [-d for d in recent if d < 0]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+
+def compute_ma(closes: list[float], period: int) -> float | None:
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def compute_technicals(closes: list[float]) -> dict:
+    return {
+        "rsi14": compute_rsi(closes, 14),
+        "ma20": compute_ma(closes, 20),
+        "ma50": compute_ma(closes, 50),
+    }
+
+
+def format_technicals(tech: dict, decimals: int = 2) -> str:
+    rsi = tech.get("rsi14")
+    ma20 = tech.get("ma20")
+    ma50 = tech.get("ma50")
+
+    if rsi is not None:
+        if rsi >= 70:
+            rsi_note = "перекуплен"
+        elif rsi <= 30:
+            rsi_note = "перепродан"
+        else:
+            rsi_note = "нейтрально"
+        rsi_line = f"RSI(14): {rsi} ({rsi_note})"
+    else:
+        rsi_line = "RSI(14): недостаточно данных"
+
+    if ma20 is not None and ma50 is not None:
+        trend = "восходящий (MA20 выше MA50)" if ma20 > ma50 else "нисходящий (MA20 ниже MA50)"
+        ma_line = f"MA20: {ma20:,.{decimals}f} | MA50: {ma50:,.{decimals}f} — тренд {trend}"
+    else:
+        ma_line = "MA20/MA50: недостаточно данных"
+
+    return f"{rsi_line}\n{ma_line}"
+
+
 # ---------- Данные по биткоину (реальные цены, не выдумка) ----------
 
 async def fetch_btc_market_data() -> dict:
     """Binance вместо CoinGecko: не требует ключа и заметно реже блокирует
-    облачные IP (Railway/Render и т.п.)."""
+    облачные IP (Railway/Render и т.п.). limit=100 дневных свечей — с запасом
+    для MA50."""
     async with aiohttp.ClientSession() as session:
         async with session.get(BINANCE_TICKER_URL, timeout=15) as resp:
             resp.raise_for_status()
@@ -326,17 +384,21 @@ async def fetch_btc_market_data() -> dict:
 
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
     klines_7d = klines[-7:] if len(klines) >= 7 else klines
     highs_7d = [float(k[2]) for k in klines_7d]
     lows_7d = [float(k[3]) for k in klines_7d]
+    highs_30 = highs[-30:] if len(highs) >= 30 else highs
+    lows_30 = lows[-30:] if len(lows) >= 30 else lows
 
     return {
         "price": current_price,
         "change_24h": change_24h,
         "low_7d": min(lows_7d) if lows_7d else current_price,
         "high_7d": max(highs_7d) if highs_7d else current_price,
-        "low_30d": min(lows) if lows else current_price,
-        "high_30d": max(highs) if highs else current_price,
+        "low_30d": min(lows_30) if lows_30 else current_price,
+        "high_30d": max(highs_30) if highs_30 else current_price,
+        **compute_technicals(closes),
     }
 
 
@@ -589,12 +651,17 @@ NEWS_DIGEST_PROMPT = """Ты финансовый редактор. Вот сы�
 ASK_PROMPT = """Ты финансовый ассистент, помогаешь с вопросами о рынках
 (форекс, товары, индексы, крипто) и вообще любыми вопросами пользователя.
 
+Актуальные цифры по активу из вопроса (если распознан):
+{asset_data}
+
 Немного свежего рыночного контекста (может быть не по теме вопроса —
 используй только если релевантно):
 {headlines}
 
 Вопрос пользователя: {question}
 
+Если в разделе "Актуальные цифры" есть данные — используй именно их для ответа
+на вопрос о цене/курсе, не говори, что у тебя нет доступа к текущим данным.
 Ответь по-русски, по делу, без лишних вступлений. Если вопрос не по
 финансовой теме — всё равно ответь как обычный полезный ассистент."""
 
@@ -901,18 +968,68 @@ async def on_news(message: Message) -> None:
     await message.answer(f"🗞 <b>Дайджест новостей</b>\n\n{digest}", parse_mode="HTML")
 
 
+async def gather_asset_context(question: str) -> str:
+    """Если в вопросе упоминается конкретный актив (BTC, индекс, валютная
+    пара) — подтягиваем по нему реальные цифры, чтобы Claude не отвечал
+    "у меня нет доступа к текущим данным", хотя данные у бота есть."""
+    q = question.lower()
+    parts = []
+
+    if any(k in q for k in ("btc", "биткоин", "битко", "bitcoin")):
+        try:
+            data = await fetch_btc_market_data()
+            parts.append("Биткоин (реальные данные):\n" + format_btc_raw(data))
+        except Exception:
+            logger.exception("Не удалось получить BTC для /ask")
+
+    index_map = [
+        (("dax",), "DAX40"),
+        (("nasdaq", "насдак"), "NASDAQ"),
+        (("s&p", "sp500", "s&p500", "спп 500", "снп 500"), "SP500"),
+    ]
+    seen_indices = set()
+    for keywords, key in index_map:
+        if key in seen_indices or key in q or any(k in q for k in keywords):
+            if key in seen_indices:
+                continue
+            seen_indices.add(key)
+            try:
+                asset = INDEX_ASSETS[key]
+                data = await fetch_index_data(asset["symbol"])
+                parts.append(f"{asset['label']} (реальные данные):\n" + format_index_raw(asset["label"], data))
+            except Exception:
+                logger.exception(f"Не удалось получить индекс {key} для /ask")
+
+    match = re.search(r"\b([a-zA-Z]{3})\s*/?\s*([a-zA-Z]{3})\b", question)
+    if match:
+        pair = parse_pair(match.group(1) + match.group(2))
+        if pair and "BTC" not in pair:
+            try:
+                fx = await fetch_fx_price_data(*pair)
+                if fx:
+                    parts.append(f"{pair[0]}/{pair[1]} (реальный курс):\n" + format_fx_raw(fx))
+            except Exception:
+                logger.exception("Не удалось получить курс пары для /ask")
+
+    return "\n\n".join(parts)
+
+
 async def answer_question(message: Message, question: str) -> None:
     if not question.strip():
         await message.answer("Напиши вопрос после команды, например: /ask что будет с долларом на этой неделе?")
         return
+    asset_data = await gather_asset_context(question)
     headlines = fetch_recent_headlines(limit=8)
     prompt = ASK_PROMPT.format(
+        asset_data=asset_data or "нет данных по конкретному активу — вопрос, видимо, не о цене конкретного инструмента",
         headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
         question=question.strip(),
     )
-    fallback = "AI-ответ недоступен без ANTHROPIC_API_KEY. Свежие заголовки:\n" + (
-        "\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков"
-    )
+    fallback_parts = ["AI-ответ недоступен без ANTHROPIC_API_KEY."]
+    if asset_data:
+        fallback_parts.append(asset_data)
+    fallback_parts.append("Свежие заголовки:\n" + ("\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков"))
+    fallback = "\n\n".join(fallback_parts)
     answer = await ask_claude(prompt, fallback)
     await message.answer(answer, parse_mode="HTML")
 
