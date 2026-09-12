@@ -8,6 +8,13 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
      как обычно эта статистика влияет на валюту, чего ждёт рынок (по
      прогнозу/предыдущему значению) и что будет, если факт выйдет выше/ниже
      ожиданий — с учётом свежих новостных заголовков за последние часы.
+   - ИСКЛЮЧЕНИЕ: за 1 час до Non-Farm Payrolls (NFP) — отдельный расширенный
+     разбор (не 3 предложения, а до 6 структурированных пунктов): ожидания
+     по вторичным показателям (безработица, зарплаты), связь с ожиданиями по
+     ставке ФРС, сценарии "лучше/хуже/в рамках прогноза" отдельно для
+     USD/золота/S&P 500, и риск пересмотра прошлых месяцев. NFP — самый
+     влиятельный макрорелиз месяца, поэтому для него единственного делается
+     исключение из принципа "коротко и по делу".
 3. Если сегодня важных релизов НЕТ:
    - один раз, перед открытием NYSE (9:30 по Нью-Йорку), присылает общую
      сводку факторов, которые могут повлиять на рынок сегодня, на основе
@@ -25,6 +32,12 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    фактам) и «Что это может значить» (короткий вывод). Команда /ask <вопрос>
    или просто обычное сообщение без команды — бот ответит на любой вопрос
    с учётом свежих заголовков как контекста.
+5. Команда /passport — подписка на отдельный трекер: бот в первые 15 минут
+   каждого часа проверяет каждые 3 минуты, не появились ли свободные даты в
+   электронной очереди на загранпаспорт (warszawa.pasport.org.ua/solutions/
+   e-queue), и уведомляет подписавшихся, если появились. Использует headless
+   Chromium (Playwright), т.к. даты подгружаются через JS, обычным запросом
+   не поймать.
 
 Защита от устаревших фактов: у Claude есть дата отсечки обучающих данных, и
 он может "помнить" неактуальную информацию (например, кто занимает пост главы
@@ -60,10 +73,11 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
    дороже за токен, чем Haiku.
 
 Зависимости (requirements.txt):
-    aiogram, aiohttp, feedparser, anthropic
+    aiogram, aiohttp, feedparser, anthropic, playwright
 
 Запуск:
     pip install -r requirements.txt
+    playwright install --with-deps chromium
     export BOT_TOKEN="..."
     export ANTHROPIC_API_KEY="..."
     python forex_bot.py
@@ -78,6 +92,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from playwright.async_api import async_playwright
 import aiohttp
 import feedparser
 from aiogram import Bot, Dispatcher, F
@@ -158,12 +173,19 @@ POLL_INTERVAL = 5 * 60  # как часто "просыпаться" и свер
 DATA_DIR = Path(__file__).parent
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 STATE_FILE = DATA_DIR / "daily_state.json"
+PASSPORT_SUBSCRIBERS_FILE = DATA_DIR / "passport_subscribers.json"
+
+PASSPORT_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
+PASSPORT_SERVICE_LABEL = "Закордонний паспорт"  # пункт в списке "Послуга *"
+PASSPORT_CHECK_WINDOW_MIN = 15   # проверяем только первые N минут часа
+PASSPORT_CHECK_INTERVAL = 3 * 60  # раз в 3 минуты внутри этого окна
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _calendar_cache: dict = {"data": None, "fetched_at": None}
 _cot_cache: dict = {}  # currency -> (fetched_at, data)
+_passport_last_seen: list[str] = []  # для дедупликации уведомлений
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -193,9 +215,27 @@ def add_subscriber(chat_id: int) -> None:
         save_json(SUBSCRIBERS_FILE, list(subs))
 
 
+def get_passport_subscribers() -> set[int]:
+    return set(load_json(PASSPORT_SUBSCRIBERS_FILE, []))
+
+
+def add_passport_subscriber(chat_id: int) -> bool:
+    """Возвращает True, если это новая подписка."""
+    subs = get_passport_subscribers()
+    if chat_id in subs:
+        return False
+    subs.add(chat_id)
+    save_json(PASSPORT_SUBSCRIBERS_FILE, list(subs))
+    return True
+
+
 def load_state() -> dict:
+    """Сброс по нью-йоркской дате (не по UTC/серверной!) — иначе UTC-полночь
+    (02:00 в Варшаве летом) приходится на середину нью-йоркского дня, флаг
+    "сводка отправлена" сбрасывается раньше времени, и условие "уже после
+    открытия NYSE" тут же оказывается истинным — бот стреляет посреди ночи."""
     state = load_json(STATE_FILE, {})
-    today_str = date.today().isoformat()
+    today_str = datetime.now(NY_TZ).date().isoformat()
     if state.get("date") != today_str:
         state = {"date": today_str, "notified_events": [], "quiet_summary_sent": False}
         save_json(STATE_FILE, state)
@@ -497,7 +537,49 @@ def format_fx_raw(data: dict) -> str:
     return base + "\n" + format_technicals(data, decimals=4)
 
 
-# ---------- COT: позиционирование крупных трейдеров (CFTC, раз в неделю) ----------
+# ---------- Электронная очередь на загранпаспорт (Playwright, т.к. JS) ----------
+
+async def check_passport_slots() -> list[str]:
+    """Возвращает список текстов доступных дат/дней в электронной очереди.
+    Пустой список — свободных дат сейчас нет (или их не удалось прочитать —
+    в этом случае тоже возвращаем [], чтобы не спамить ложными уведомлениями,
+    но ошибка логируется).
+
+    ВАЖНО: сайт рендерит форму через JS (QMotion Suite), поэтому обычный
+    HTTP-запрос ничего не покажет — нужен настоящий браузер. Селекторы ниже
+    подобраны по видимому тексту на странице (наиболее устойчивый способ),
+    но живьём это не протестировано — если после деплоя увидишь в логах
+    ошибку на этом шаге, пришли текст ошибки, поправим селектор."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.goto(PASSPORT_URL, timeout=30000, wait_until="networkidle")
+
+            # Открываем выпадающий список "Послуга *" и выбираем услугу
+            await page.get_by_text("Послуга", exact=False).first.click()
+            await page.get_by_text(PASSPORT_SERVICE_LABEL, exact=False).first.click()
+            await page.wait_for_timeout(2500)  # ждём подгрузки списка дней по AJAX
+
+            # Смотрим варианты в поле "Обрати день" — считаем его открытым
+            # списком/select и вытаскиваем текст всех пунктов
+            day_field = page.get_by_text("Обрати день", exact=False).first
+            container = day_field.locator("xpath=..")
+            items = await container.locator("li, option, [role='option']").all_inner_texts()
+
+            available = [
+                t.strip() for t in items
+                if t.strip() and "обрати" not in t.strip().lower() and "немає" not in t.strip().lower()
+            ]
+            return available
+        except Exception:
+            logger.exception("Ошибка при проверке электронной очереди на паспорт")
+            return []
+        finally:
+            await browser.close()
+
+
+
 
 async def fetch_cot_positioning(currency: str) -> dict | None:
     """Данные CFTC по фьючерсам на валюту — во сколько лонгов/шортов сидят
@@ -563,27 +645,59 @@ PREDICT_PROMPT = """Ты аналитик форекс-рынка. Через ч
 только релевантные):
 {headlines}
 
-Напиши короткий прогноз по-русски (4-5 предложений):
-- как этот показатель обычно влияет на валюту;
-- если факт выйдет ЛУЧШЕ прогноза — что вероятно произойдёт с валютой;
-- если факт выйдет ХУЖЕ прогноза — что вероятно произойдёт с валютой;
-- отдельно — как это может отразиться на золоте (XAU/USD) и нефти (WTI/Brent),
-  если показатель по USD (доллар и золото/нефть обычно двигаются в противофазе,
-  доллар и нефть — по-разному в зависимости от причины движения);
-- если в заголовках есть релевантный контекст (в т.ч. по золоту/нефти/OPEC), учти его.
-Без общих фраз и дисклеймеров, только суть."""
+Дай короткий прогноз по-русски, максимум 3 предложения: как этот показатель
+обычно влияет на валюту, что вероятно при факте лучше/хуже прогноза, и — если
+показатель по USD — коротко про золото/нефть (доллар и золото обычно
+двигаются в противофазе). Учитывай релевантные заголовки, если такие есть.
+Без вступлений и общих фраз — сразу суть."""
 
-QUIET_PROMPT = """Ты аналитик форекс и товарных рынков. Сегодня нет запланированных
-важных экономических релизов по основным валютам. Перед открытием NYSE дай
-короткую сводку по-русски (4-6 предложений) на основе свежих новостных
-заголовков: что может повлиять сегодня на доллар и другие основные валюты, а
-также отдельно — на золото (XAU/USD) и нефть (WTI/Brent), если такие факторы
-вообще просматриваются в заголовках (геополитика, решения OPEC+, запасы нефти,
-спрос на защитные активы и т.п.). Если ничего значимого нет — так и скажи
-одной фразой, не выдумывай.
+NFP_KEYWORDS = ("non-farm", "nonfarm", "nfp", "payroll")
 
-Заголовки:
-{headlines}"""
+NFP_PROMPT = """Ты старший аналитик форекс-рынка. Через час выходит отчёт по
+рынку труда США (Non-Farm Payrolls) — самый влиятельный макрорелиз месяца.
+Это единственный релиз, где нужен развёрнутый разбор, а не короткая сводка.
+
+Прогноз рынка по занятости: {forecast}
+Предыдущее значение: {previous}
+
+Свежие новостные заголовки последних часов (ищи там: пересмотры прошлых
+месяцев, среднюю почасовую оплату/wage growth, уровень безработицы,
+labor force participation, актуальные ожидания рынка по ставке ФРС/CME
+FedWatch, риторику членов ФРС в последние дни, динамику доходности гособлигаций
+и индекса доллара — используй только то, что реально есть в заголовках,
+не выдумывай цифры, которых там нет):
+{headlines}
+
+Дай структурированный разбор по-русски, до 6 коротких пунктов:
+- Что именно ожидает рынок (не только основная цифра, но и вторичные
+  показатели — безработица, зарплаты — если они упомянуты в заголовках)
+- Как текущие ожидания по ставке ФРС завязаны на этот отчёт (если заголовки
+  дают контекст)
+- Сценарий "значительно лучше прогноза" — что вероятно с USD, золотом, S&P 500
+- Сценарий "значительно хуже прогноза" — что вероятно с USD, золотом, S&P 500
+- Сценарий "около прогноза" — вероятна ли волатильность всё равно
+- Один рискованный момент, на который стоит обратить внимание (пересмотры
+  прошлых месяцев часто двигают рынок сильнее самой цифры)
+
+Без вступлений и дисклеймеров, только конкретика. Если по какому-то пункту
+в заголовках нет данных — пропусти его, не выдумывай."""
+
+QUIET_PROMPT = """Ты аналитик форекс и товарных рынков. Сегодня нет
+запланированных важных экономических релизов по основным валютам.
+
+Свежие заголовки:
+{headlines}
+
+Выбери из них только 2-3 САМЫХ значимых для рынков фактора (макроэкономика,
+геополитика, решения центробанков, OPEC+, крупные корпоративные/политические
+события) — остальное это шум, игнорируй. Дай короткую сводку по-русски,
+максимум 3 предложения: что происходит и как это может отразиться на
+долларе/основных валютах, золоте (XAU/USD) или нефти (WTI/Brent) — только
+если реально релевантно, не притягивай за уши. Без вступлений, без "стоит
+отметить", без "следует учитывать" и подобных оборотов — сразу суть.
+
+Если из заголовков ничего значимого не выделяется, ответь ровно одной фразой:
+"Значимых факторов не просматривается." — и не выдумывай контекст."""
 
 FORECAST_PROMPT = """Ты аналитик форекс, товарных и фондовых рынков. Вот
 экономические события на сегодня (High/Medium impact) по основным валютам:
@@ -650,19 +764,19 @@ NEWS_DIGEST_PROMPT = """Ты финансовый редактор. Вот сы�
 {headlines}
 
 Сделай дайджест по-русски в двух блоках (используй HTML-теги <b> для
-заголовков блоков):
+заголовков блоков). Не пересказывай все заголовки подряд — выбери только
+3-5 САМЫХ значимых для рынков, остальное это шум:
 
 <b>Главное</b>
-4-6 пунктов через тире — просто перескажи своими словами, что реально
-произошло, БЕЗ анализа, только факты по заголовкам (переведи и объедини
-похожие).
+3-5 пунктов через тире, только самое важное, БЕЗ анализа — просто факты
+своими словами (переведи и объедини похожие темы в один пункт).
 
 <b>Что это может значить</b>
-2-4 предложения — краткий вывод, как это может повлиять на валюты, индексы,
-золото, нефть или крипту.
+Максимум 2 предложения — краткий вывод, как это может повлиять на валюты,
+индексы, золото, нефть или крипту. Без вступлений и общих фраз.
 
-Если заголовки малозначимы или это в основном шум — так и скажи в конце
-коротко."""
+Если заголовки малозначимы или это в основном шум — так и скажи одной фразой
+и не выдумывай значимость."""
 
 ASK_PROMPT = """Ты финансовый ассистент, помогаешь с вопросами о рынках
 (форекс, товары, индексы, крипто) и вообще любыми вопросами пользователя.
@@ -1081,16 +1195,25 @@ async def scheduler_loop() -> None:
                             f"Прогноз рынка: {ev.get('forecast') or 'нет данных'}\n"
                             f"Предыдущее значение: {ev.get('previous') or 'нет данных'}"
                         )
-                        prediction = await ask_claude(PREDICT_PROMPT.format(
-                            currency=ev.get("country"),
-                            title=ev.get("title"),
-                            forecast=ev.get("forecast") or "нет данных",
-                            previous=ev.get("previous") or "нет данных",
-                            headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
-                        ), raw_fallback)
+                        is_nfp = any(kw in ev.get("title", "").lower() for kw in NFP_KEYWORDS)
+                        if is_nfp:
+                            prediction = await ask_claude(NFP_PROMPT.format(
+                                forecast=ev.get("forecast") or "нет данных",
+                                previous=ev.get("previous") or "нет данных",
+                                headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+                            ), raw_fallback, max_tokens=700)
+                        else:
+                            prediction = await ask_claude(PREDICT_PROMPT.format(
+                                currency=ev.get("country"),
+                                title=ev.get("title"),
+                                forecast=ev.get("forecast") or "нет данных",
+                                previous=ev.get("previous") or "нет данных",
+                                headlines="\n".join(f"- {h}" for h in headlines) or "нет свежих заголовков",
+                            ), raw_fallback)
                         time_str = ev["_dt"].astimezone().strftime("%H:%M")
+                        emoji = "🇺🇸" if is_nfp else "🔮"
                         text = (
-                            f"🔮 <b>Через час: {ev.get('country')} — {ev.get('title')} ({time_str})</b>\n\n"
+                            f"{emoji} <b>Через час: {ev.get('country')} — {ev.get('title')} ({time_str})</b>\n\n"
                             f"{prediction}"
                         )
                         await send_to_subscribers(text)
@@ -1128,7 +1251,49 @@ BOT_COMMANDS = [
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
     BotCommand(command="news", description="Дайджест новостей: главное + что это значит"),
     BotCommand(command="ask", description="Задать любой вопрос боту"),
+    BotCommand(command="passport", description="Подписка: уведомления о слотах на загранпаспорт"),
 ]
+
+
+@dp.message(Command("passport"))
+async def on_passport(message: Message) -> None:
+    is_new = add_passport_subscriber(message.chat.id)
+    if is_new:
+        await message.answer(
+            "Подписал на уведомления о свободных датах в электронной очереди на "
+            "загранпаспорт (Варшава). Проверяю каждые 3 минуты в первые 15 минут "
+            "каждого часа — как только появится слот, напишу сюда."
+        )
+    else:
+        await message.answer("Ты уже подписан на уведомления по паспортной очереди.")
+
+
+async def passport_watcher_loop() -> None:
+    global _passport_last_seen
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.minute < PASSPORT_CHECK_WINDOW_MIN:
+            try:
+                available = await check_passport_slots()
+                if available and available != _passport_last_seen:
+                    text = (
+                        "🛂 <b>Появились свободные даты на загранпаспорт!</b>\n\n"
+                        + "\n".join(f"- {d}" for d in available)
+                        + f"\n\nЗаписывайся скорее: {PASSPORT_URL}"
+                    )
+                    for chat_id in get_passport_subscribers():
+                        try:
+                            await bot.send_message(chat_id, text, parse_mode="HTML")
+                        except Exception:
+                            logger.exception(f"Не удалось отправить паспортное уведомление в {chat_id}")
+                _passport_last_seen = available
+            except Exception:
+                logger.exception("Ошибка в цикле проверки паспортной очереди")
+            await asyncio.sleep(PASSPORT_CHECK_INTERVAL)
+        else:
+            # ждём до начала следующего часа
+            seconds_to_next_hour = 3600 - (now.minute * 60 + now.second)
+            await asyncio.sleep(max(seconds_to_next_hour, 30))
 
 
 async def main() -> None:
@@ -1138,6 +1303,7 @@ async def main() -> None:
         logger.warning("ANTHROPIC_API_KEY не задан — бот работает без AI-анализа, только сырые данные")
     await bot.set_my_commands(BOT_COMMANDS)
     asyncio.create_task(scheduler_loop())
+    asyncio.create_task(passport_watcher_loop())
     await dp.start_polling(bot)
 
 
